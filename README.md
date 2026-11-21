@@ -7,11 +7,11 @@ The REST + realtime API that powers **DualSphere**, a social network where every
 
 This repo is one of three:
 
-| Repo | What it is | Default port |
-| --- | --- | --- |
-| **Backend** (this repo) | Express API, PostgreSQL, Socket.io | `4000` |
-| Frontend | The user-facing Next.js web app | `3000` |
-| Admin | The staff / moderation panel (Next.js) | `3001` |
+| Repo | What it is |
+| --- | --- |
+| **Backend** (this repo) | Express API, PostgreSQL, Socket.io |
+| Frontend | The user-facing Next.js web app |
+| Admin | The staff / moderation panel (Next.js) |
 
 ---
 
@@ -85,28 +85,7 @@ Every staff action is written to `audit_logs`. Each entry is signed with an HMAC
 
 ---
 
-## Project structure
-
-```
-src/
-├── server.ts            # Boots the app: DB, Redis, settings, Socket.io, background cleanup jobs
-├── app.ts               # Express app: security middleware, routes under /api/v1
-├── config/              # env parsing and validation, PostgreSQL pool, Redis client
-├── db/
-│   ├── create.ts        # Creates the database
-│   ├── migrate.ts       # Runs SQL migrations in order
-│   ├── seed.ts          # Seeds the first admin / moderator accounts
-│   └── migrations/      # 001_init.sql … numbered SQL files
-├── routes/              # auth, posts, feed, users, comments, messages, friends, stories, admin, …
-├── services/            # Business logic, one service per area (identity, audit, abuse, feed, …)
-├── middleware/          # auth, RBAC, rate limiting, validation, security guards, errors
-├── lib/                 # crypto, JWT, TOTP, mailer, storage (R2/local), realtime, permissions
-├── validators/          # Zod schemas
-└── types/
-uploads/                 # Local media storage (used only when R2 is not configured)
-```
-
-### API overview
+## API overview
 
 Every endpoint is under `/api/v1`:
 
@@ -140,27 +119,6 @@ Every endpoint is under `/api/v1`:
 - PostgreSQL 14+
 - Redis (optional)
 
-### Setup
-
-```bash
-# 1. Install dependencies
-npm install
-
-# 2. Create your environment file
-cp .env.example .env
-
-# 3. Generate the secret keys and paste them into .env
-npm run keys
-
-# 4. Create the database, run migrations and seed the staff accounts
-npm run db:setup
-
-# 5. Start the dev server (reloads on change)
-npm run dev
-```
-
-The API runs at `http://localhost:4000`.
-
 ### Environment variables
 
 Every variable is listed in `.env.example`. The main groups are:
@@ -173,22 +131,6 @@ Every variable is listed in `.env.example`. The main groups are:
 - **TURN (optional):** for calls between networks that STUN can't connect
 - **SMTP (optional):** leave empty to print emails to the console
 - **Seed accounts:** used once by `npm run db:seed` to create the first admin and moderator
-
-> ⚠️ Never commit `.env`. It is already in `.gitignore`. Use strong, unique values in production, and change the seed passwords right after the first login.
-
-### Scripts
-
-| Command | Description |
-| --- | --- |
-| `npm run dev` | Start in watch mode |
-| `npm run build` | Compile TypeScript to `dist/` |
-| `npm start` | Run the compiled server |
-| `npm run typecheck` | Type-check without emitting files |
-| `npm run db:create` | Create the database |
-| `npm run db:migrate` | Apply migrations |
-| `npm run db:seed` | Seed the staff accounts |
-| `npm run db:setup` | create + migrate + seed |
-| `npm run keys` | Print freshly generated secret keys |
 
 ---
 
