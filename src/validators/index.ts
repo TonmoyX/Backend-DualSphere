@@ -59,6 +59,9 @@ export const createPostSchema = z.object({
   content: z.string().max(5000).default(''),
   mediaIds: z.array(uuid).max(10).default([]),
   sharePolicy: z.enum(['everyone', 'friends', 'none']).default('everyone'),
+  communityId: uuid.optional(), // post into a community (membership + anon policy checked server-side)
+  access: z.enum(['public', 'subscribers', 'paid']).default('public'), // creators only, identity posts only
+  priceMinor: z.number().int().positive().max(100_000_000).optional(),
 });
 export const sharePostSchema = z.object({
   content: z.string().max(5000).default(''),
@@ -72,7 +75,8 @@ export const createPostWithModeSchema = createPostSchema.extend({
 });
 
 export const feedQuery = z.object({
-  mode: z.enum(['all', 'identity', 'anonymous']).default('all'),
+  mode: z.enum(['all', 'identity', 'anonymous', 'communities']).default('all'),
+  media: z.enum(['video']).optional(), // Reels: only posts with a video
   cursor: z.string().max(200).optional(),
   limit: z.coerce.number().int().min(1).max(50).default(20),
   q: z.string().trim().max(100).optional(),
@@ -104,6 +108,13 @@ export const updateMeSchema = z.object({
   profileLocked: z.boolean().optional(),
   friendsVisibility: z.enum(['public', 'friends', 'only_me']).optional(),
   shareAvatarToFeed: z.boolean().optional(),
+  shareCoverToFeed: z.boolean().optional(),
+  followingVisibility: z.enum(['public', 'friends', 'only_me']).optional(),
+  birthdayDisplay: z.enum(['hidden', 'day_month', 'full']).optional(),
+  work: z.string().trim().max(100).optional(),
+  education: z.string().trim().max(100).optional(),
+  location: z.string().trim().max(100).optional(),
+  hobbies: z.array(z.string().trim().min(1).max(30)).max(10).optional(),
 });
 
 // ── media ──
@@ -111,7 +122,7 @@ export const presignSchema = z.object({
   filename: z.string().min(1).max(200),
   contentType: z.string().min(3).max(100),
   size: z.number().int().positive(),
-  purpose: z.enum(['post', 'avatar', 'cover', 'message', 'story']).default('post'),
+  purpose: z.enum(['post', 'avatar', 'cover', 'message', 'story', 'community', 'ad']).default('post'),
 });
 
 // ── moderation / admin ──
@@ -154,3 +165,46 @@ export const auditQuery = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
+
+// ── communities ──
+export const communitySlug = z.string().trim().toLowerCase().regex(/^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/, 'Link name: 3–32 lowercase letters, numbers or dashes');
+export const communitySlugParam = z.object({ slug: communitySlug });
+export const communityMemberParam = z.object({ slug: communitySlug, userId: uuid });
+export const communityPostParam = z.object({ slug: communitySlug, postId: uuid });
+const communityVisibility = z.enum(['public', 'private', 'invite_only']);
+const anonPolicy = z.enum(['off', 'allowed', 'anon_only']);
+const tags = z.array(z.string().trim().min(1).max(24)).max(5);
+export const createCommunitySchema = z.object({
+  name: z.string().trim().min(3).max(60),
+  slug: communitySlug,
+  description: z.string().trim().max(1000).default(''),
+  visibility: communityVisibility.default('public'),
+  anonPolicy: anonPolicy.default('allowed'),
+  postApproval: z.boolean().default(false),
+  tags: tags.default([]),
+});
+export const updateCommunitySchema = z.object({
+  name: z.string().trim().min(3).max(60).optional(),
+  description: z.string().trim().max(1000).optional(),
+  visibility: communityVisibility.optional(),
+  anonPolicy: anonPolicy.optional(),
+  postApproval: z.boolean().optional(),
+  tags: tags.optional(),
+  iconMediaId: uuid.nullable().optional(),
+  bannerMediaId: uuid.nullable().optional(),
+}).strict();
+export const communityRulesSchema = z.object({
+  rules: z.array(z.object({ title: z.string().trim().min(1).max(100), body: z.string().trim().max(500).default('') })).max(15),
+});
+export const joinCommunitySchema = z.object({
+  message: z.string().trim().max(300).optional(),
+  invite: z.string().trim().regex(/^[A-Za-z0-9_-]{12,40}$/).optional(),
+});
+export const communityRoleSchema = z.object({ role: z.enum(['mod', 'member']) });
+export const communityRemoveSchema = z.object({ ban: z.boolean().default(false), reason: z.string().trim().max(300).default('') });
+export const communityMuteSchema = z.object({ hours: z.number().int().min(0).max(720) });
+export const communityInviteSchema = z.object({ maxUses: z.number().int().min(1).max(1000).default(50), expiresInDays: z.number().int().min(1).max(30).default(7) });
+export const communityInviteParam = z.object({ slug: communitySlug, code: z.string().regex(/^[A-Za-z0-9_-]{12,40}$/) });
+export const communityDecisionSchema = z.object({ approve: z.boolean(), reason: z.string().trim().max(300).optional() });
+export const communityDeleteSchema = z.object({ confirmName: z.string().trim().min(1).max(60) });
+export const communityTransferSchema = z.object({ userId: uuid });

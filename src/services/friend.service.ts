@@ -6,6 +6,7 @@ import { one, query, tx } from '../config/db.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { emit } from '../lib/realtime.js';
 import { publicUser } from '../lib/serialize.js';
+import { followEachOther, unfollowEachOther } from './follow.service.js';
 import { notificationService } from './notification.service.js';
 import { getSettings } from './settings.service.js';
 
@@ -129,6 +130,8 @@ export const friendService = {
       if (!del.rowCount) return false;
       const [a, b] = pair(me, sender);
       await c.query('INSERT INTO friendships (user_a, user_b) VALUES ($1, $2) ON CONFLICT DO NOTHING', [a, b]);
+      // New friends follow each other (either can unfollow later and stay friends)
+      await followEachOther(a, b, c);
       // Any message request between the two becomes a normal chat
       await c.query(
         `UPDATE conversation_participants p SET status = 'accepted'
@@ -155,6 +158,7 @@ export const friendService = {
   async unfriend(me: string, other: string) {
     const [a, b] = pair(me, other);
     await query('DELETE FROM friendships WHERE user_a = $1 AND user_b = $2', [a, b]);
+    await unfollowEachOther(me, other);
     emit.users([me, other], 'friend:update', { users: [me, other] });
     return { status: 'none' as FriendStatus };
   },
@@ -164,6 +168,7 @@ export const friendService = {
     const [a, b] = pair(me, other);
     await query('DELETE FROM friendships WHERE user_a = $1 AND user_b = $2', [a, b]);
     await query('DELETE FROM friend_requests WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1)', [me, other]);
+    await unfollowEachOther(me, other);
   },
 
   async list(userId: string, viewerId: string | undefined, q?: string, limit = 60) {

@@ -17,7 +17,7 @@ export interface PublicPost {
   content: string;
   media: { id?: string; url: string; type: 'image' | 'video'; mime?: string }[];
   visibility: 'identity' | 'anonymous';
-  postType: 'regular' | 'avatar_update';
+  postType: 'regular' | 'avatar_update' | 'cover_update';
   author: PublicAuthor | null;
   likesCount: number;
   commentsCount: number;
@@ -36,7 +36,7 @@ export function publicPost(row: any, opts: { liked?: boolean; owner?: boolean } 
     content: row.content,
     media: Array.isArray(row.media) ? row.media.map((m: any) => ({ id: m.id, url: m.url, type: m.type, mime: m.mime })) : [],
     visibility: row.visibility,
-    postType: (row.post_type ?? 'regular') as 'regular' | 'avatar_update',
+    postType: (row.post_type ?? 'regular') as 'regular' | 'avatar_update' | 'cover_update',
     // NEVER expose author for anonymous posts — enforced here AND by a DB CHECK constraint
     author: isIdentity && row.author_id
       ? {
@@ -76,16 +76,39 @@ export function publicUser(row: any) {
 }
 
 /** The signed-in user's own view (adds private-but-own fields). */
+/** Birthday as the owner chose to show it: nothing, day + month, or the full date. Never the raw value. */
+export function visibleBirthday(row: any): { day: number; month: number; year?: number } | null {
+  const mode = row.birthday_display ?? 'hidden';
+  if (mode === 'hidden' || !row.birth_date) return null;
+  const [y, m, d] = String(row.birth_date).slice(0, 10).split('-').map(Number);
+  if (!m || !d) return null;
+  return mode === 'full' ? { day: d, month: m, year: y } : { day: d, month: m };
+}
+
+/** Optional "About" details — only on full profiles and your own account, not on every post author. */
+export function profileDetails(row: any) {
+  return {
+    work: row.work ?? '',
+    education: row.education ?? '',
+    location: row.location ?? '',
+    hobbies: (row.hobbies ?? []) as string[],
+    birthday: visibleBirthday(row),
+  };
+}
+
 export function selfUser(row: any, anonAccountAgeHours: number) {
   const created = new Date(row.created_at).getTime();
   const anonAvailableAt = new Date(created + anonAccountAgeHours * 3600_000);
   return {
     ...publicUser(row),
+    ...profileDetails(row),
     email: row.email,
     mfaEnabled: !!row.mfa_enabled,
     birthDate: row.birth_date ?? null,
+    birthdayDisplay: (row.birthday_display ?? 'hidden') as 'hidden' | 'day_month' | 'full',
     gender: row.gender ?? null,
     showActivity: row.show_activity !== false,
+    followingVisibility: (row.following_visibility ?? 'public') as 'public' | 'friends' | 'only_me',
     friendsVisibility: (row.friends_visibility ?? 'public') as 'public' | 'friends' | 'only_me',
     anonAvailableAt: anonAvailableAt.toISOString(),
     permissions: effectivePermissions(row.role, row.permissions), // staff panel uses this to show/hide sections

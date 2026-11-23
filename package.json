@@ -2,7 +2,7 @@
   "name": "dualsphere-api",
   "version": "1.0.0",
   "private": true,
-  "description": "DualSphere API — Express + PostgreSQL + JWT + Cloudflare R2 + Socket.io",
+  "description": "DualSphere API \u2014 Express + PostgreSQL + JWT + Cloudflare R2 + Socket.io",
   "type": "module",
   "scripts": {
     "dev": "tsx watch --env-file=.env src/server.ts",
@@ -13,12 +13,15 @@
     "db:migrate": "tsx --env-file=.env src/db/migrate.ts",
     "db:seed": "tsx --env-file=.env src/db/seed.ts",
     "db:setup": "npm run db:create && npm run db:migrate && npm run db:seed",
-    "keys": "node -e \"const c=require('crypto');for(const k of ['JWT_ACCESS_SECRET','JWT_REFRESH_SECRET','IDENTITY_ENC_KEY','IDENTITY_HMAC_KEY','AUDIT_HMAC_KEY','MFA_ENC_KEY','IP_HASH_SALT'])console.log(k+'='+c.randomBytes(32).toString('hex'))\""
+    "keys": "node -e \"const c=require('crypto');for(const k of ['JWT_ACCESS_SECRET','JWT_REFRESH_SECRET','IDENTITY_ENC_KEY','IDENTITY_HMAC_KEY','AUDIT_HMAC_KEY','MFA_ENC_KEY','IP_HASH_SALT'])console.log(k+'='+c.randomBytes(32).toString('hex'))\"",
+    "worker": "node --env-file=.env dist/worker.js",
+    "worker:dev": "tsx watch --env-file=.env src/worker.ts"
   },
   "engines": {
     "node": ">=20.6"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.12.0",
     "@aws-sdk/client-s3": "^3.1173.0",
     "@aws-sdk/s3-request-presigner": "^3.1173.0",
     "bcryptjs": "^3.0.3",

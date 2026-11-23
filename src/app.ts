@@ -1,6 +1,7 @@
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import express from 'express';
+import path from 'node:path';
 import helmet from 'helmet';
 import { corsOrigins, env, isProd } from './config/env.js';
 import { UPLOAD_DIR } from './lib/storage.js';
@@ -16,6 +17,10 @@ import { adminFeedbackRoutes, feedbackRoutes } from './routes/feedback.routes.js
 import postRoutes from './routes/post.routes.js';
 import { blockRoutes, conversationRoutes, messageRoutes } from './routes/message.routes.js';
 import { friendRoutes } from './routes/friend.routes.js';
+import { enginePage } from './routes/engine.routes.js';
+import { communityRoutes } from './routes/community.routes.js';
+import { creatorRoutes, paymentRoutes, paymentWebhook, walletRoutes } from './routes/money.routes.js';
+import { adRoutes, businessRoutes } from './routes/ads.routes.js';
 
 export function createApp() {
   const app = express();
@@ -69,7 +74,17 @@ export function createApp() {
     express.static(UPLOAD_DIR, { dotfiles: 'deny', index: false, fallthrough: false }),
   );
 
+  // Brand icons (DualSphere black-hole logo)
+  const publicDir = path.resolve(process.cwd(), 'public');
+  const iconHeaders = { 'Cross-Origin-Resource-Policy': 'cross-origin', 'Cache-Control': 'public, max-age=86400' };
+  app.get('/favicon.ico', (_req, res) => res.set(iconHeaders).sendFile(path.join(publicDir, 'favicon.ico')));
+  app.get('/icon.png', (_req, res) => res.set(iconHeaders).sendFile(path.join(publicDir, 'icon.png')));
+
+  app.get('/', enginePage);
   app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
+  // Payment provider webhooks: raw body (signature checks), no cookies, no Origin header — must come before express.json
+  app.post('/api/v1/payments/webhooks/:provider', express.raw({ type: '*/*', limit: '256kb' }), paymentWebhook);
 
   app.use(cookieParser());
   app.use(express.json({ limit: '100kb' }));
@@ -95,6 +110,12 @@ export function createApp() {
   api.use('/feedback', feedbackRoutes);
   api.use('/admin/feedback', adminFeedbackRoutes);
   api.use('/stories', storyRoutes);
+  api.use('/communities', communityRoutes);
+  api.use('/creators', creatorRoutes);
+  api.use('/wallet', walletRoutes);
+  api.use('/payments', paymentRoutes);
+  api.use('/business', businessRoutes);
+  api.use('/ads', adRoutes);
   api.use('/moderation', moderationRoutes);
   api.use('/admin', adminRoutes);
   app.use('/api/v1', api);

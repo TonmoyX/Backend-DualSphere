@@ -5,6 +5,7 @@ import { storageDriver } from '../lib/storage.js';
 import type { AuthUser } from '../types/index.js';
 import { effectivePermissions } from '../lib/permissions.js';
 import { auditService } from './audit.service.js';
+import { OPEN_FLAG } from './abuse.service.js';
 import { notificationService } from './notification.service.js';
 
 const esc = (q: string) => `%${q.replace(/[%_\\]/g, '\\$&')}%`;
@@ -16,6 +17,16 @@ function adminUser(r: any) {
     abuseScore: r.abuse_score, postCount: r.post_count, mfaEnabled: r.mfa_enabled, lastLoginAt: r.last_login_at, createdAt: r.created_at,
     permissions: effectivePermissions(r.role, r.permissions), customPermissions: r.role === 'moderator' && r.permissions !== null,
   };
+}
+
+/**
+ * Moderators may only manage regular users; anything touching another staff account (profile, 2FA,
+ * sessions) needs an admin. Stops a moderator with users.manage from weakening an admin's account.
+ */
+function assertCanManage(actor: AuthUser, target: { role: string }, targetId: string) {
+  if (actor.role === 'admin') return;
+  if (actor.id === targetId) throw forbidden('SELF_ACTION', 'Use My account for your own settings');
+  if (target.role !== 'user') throw forbidden('OUTRANKED', 'Only admins can manage staff accounts');
 }
 
 export const adminService = {
@@ -35,7 +46,7 @@ export const adminService = {
         (SELECT count(*) FROM conversations)::int AS conversations,
         (SELECT count(*) FROM post_likes)::int AS likes,
         (SELECT count(*) FROM reports WHERE status = 'pending')::int AS pending_reports,
-        (SELECT count(*) FROM posts WHERE cardinality(abuse_flags) > 0 AND deleted_at IS NULL)::int AS flagged_posts,
+        (SELECT count(*) FROM posts p WHERE ${OPEN_FLAG})::int AS flagged_posts,
         (SELECT count(*) FROM sessions WHERE revoked_at IS NULL AND expires_at > now())::int AS active_sessions,
         (SELECT coalesce(sum(size_bytes),0) FROM media WHERE status <> 'pending')::bigint AS media_bytes
     `);
@@ -96,6 +107,7 @@ export const adminService = {
     const target = await one('SELECT id, role FROM users WHERE id = $1', [id]);
     if (!target) throw notFound('User');
     if (input.role && id === actor.id) throw forbidden('SELF_ACTION', 'You cannot change your own role');
+    assertCanManage(actor, target, id);
     if (input.role === 'user' && target.role === 'admin') {
       const admins = await one<{ n: number }>(`SELECT count(*)::int AS n FROM users WHERE role = 'admin'`);
       if ((admins?.n ?? 0) <= 1) throw badRequest('LAST_ADMIN', 'Cannot demote the last admin');
@@ -120,7 +132,7 @@ export const adminService = {
         targetId: id, targetType: 'user', metadata: { changes: input, previousRole: target.role },
       }, c);
     });
-    if (input.role && input.role !== target.role) emit.user(id, 'session:revoked', { reason: 'role_changed' });
+    if (input.role && input.role !== target.role) emit.revoke(id, { reason: 'role_changed' });
     return this.getUser(id);
   },
 
@@ -133,13 +145,16 @@ export const adminService = {
       await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'USER_DELETE', targetId: id, targetType: 'user', metadata: { username: t.username } }, c);
       await c.query('DELETE FROM users WHERE id = $1', [id]);
     });
-    emit.user(id, 'session:revoked', { reason: 'deleted' });
+    emit.revoke(id, { reason: 'deleted' });
   },
 
   async revokeSessions(id: string, actor: AuthUser) {
+    const t = await one<{ role: string }>('SELECT role FROM users WHERE id = $1', [id]);
+    if (!t) throw notFound('User');
+    assertCanManage(actor, t, id);
     await query('UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [id]);
     await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'SESSIONS_REVOKE', targetId: id, targetType: 'user' });
-    emit.user(id, 'session:revoked', { reason: 'admin' });
+    emit.revoke(id, { reason: 'admin' });
   },
 
   /** Choose a moderator's permissions (null = back to the default moderator set). Audited; applies on their next request. */
@@ -157,14 +172,15 @@ export const adminService = {
   /** Turn off 2FA for a user who lost their authenticator (audited; they're signed out everywhere and notified). */
   async resetMfa(id: string, actor: AuthUser) {
     if (id === actor.id) throw badRequest('USE_ACCOUNT_PAGE', 'Turn off your own 2FA from My account (needs your password and a code)');
-    const u = await one<{ mfa_enabled: boolean }>('SELECT mfa_enabled FROM users WHERE id = $1', [id]);
+    const u = await one<{ mfa_enabled: boolean; role: string }>('SELECT mfa_enabled, role FROM users WHERE id = $1', [id]);
     if (!u) throw notFound('User');
+    assertCanManage(actor, u, id);
     if (!u.mfa_enabled) throw badRequest('MFA_NOT_ENABLED', '2FA is already off for this user');
     await query('UPDATE users SET mfa_enabled = false, mfa_secret_enc = NULL WHERE id = $1', [id]);
     await query('UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [id]);
     await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'MFA_RESET', targetId: id, targetType: 'user' });
     await notificationService.create({ userId: id, type: 'security', message: 'An administrator turned off two-factor authentication on your account. Set it up again in Settings → Security.' });
-    emit.user(id, 'session:revoked', { reason: 'admin' });
+    emit.revoke(id, { reason: 'admin' });
   },
 
   async listPosts(f: { q?: string; visibility?: string; status?: string; page: number; limit: number }) {

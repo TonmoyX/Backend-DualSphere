@@ -254,7 +254,7 @@ export const authService = {
       await c.query('UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [userId]);
       await auditService.log({ actorId: userId, action: 'PASSWORD_RESET', targetId: userId, targetType: 'user' }, c);
     });
-    emit.user(userId, 'session:revoked', {});
+    emit.revoke(userId, {});
   },
 
   async changePassword(userId: string, sessionId: string, current: string, next: string) {

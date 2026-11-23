@@ -2,13 +2,18 @@ import { query } from '../config/db.js';
 import { decodeCursor, encodeCursor, publicPost, type PublicPost } from '../lib/serialize.js';
 import type { AuthUser, FeedMode } from '../types/index.js';
 import { identityService } from './identity.service.js';
+import { isStaff } from '../middleware/rbac.middleware.js';
+import { rankedFeed } from './feed-ranking.service.js';
 
-interface FeedOptions {
+export interface FeedOptions {
   mode?: FeedMode;
+  /** top = ranked "for you" feed (default for the main feed); recent = newest first */
+  sort?: 'top' | 'recent';
   cursor?: string;
   limit?: number;
   q?: string;
   authorId?: string; // profile timeline (identity only)
+  media?: 'video'; // Reels page
   viewer?: AuthUser;
 }
 
@@ -16,10 +21,18 @@ export const POST_COLUMNS = `
   p.*, u.username AS author_username, u.display_name AS author_display_name,
   u.avatar_url AS author_avatar_url, u.is_verified AS author_is_verified, u.role AS author_role`;
 
-export type HydratedPost = PublicPost & {
+export interface PostCommunity { id: string; slug: string; name: string; iconUrl: string | null }
+
+/** Paid / subscriber-only state. `locked` = the viewer hasn't paid: content is a short preview and media is withheld. */
+export interface PostAccess { access: 'public' | 'subscribers' | 'paid'; priceMinor: number | null; currency: string | null; locked: boolean; lockedMediaCount: number }
+
+export type HydratedPost = PublicPost & PostAccess & {
   savedByMe: boolean;
   canShare: boolean;
   sharedPost: PublicPost | null;
+  community: PostCommunity | null;
+  isPinned: boolean;
+  isPending: boolean;
 };
 
 /** Sharing rule. A share re-shares its original, so the original's policy applies. */
@@ -49,6 +62,47 @@ export async function hydratePosts(rows: any[], viewer?: AuthUser): Promise<Hydr
       )
     : { rows: [] as any[] };
   const originalById = new Map(originals.map((o) => [o.id as string, o]));
+
+  // Community name/link for community posts (one batched lookup)
+  const communityIds = [...new Set(rows.filter((r) => r.community_id).map((r) => r.community_id as string))];
+  const { rows: comms } = communityIds.length
+    ? await query('SELECT id, slug, name, icon_url, visibility FROM communities WHERE id = ANY($1::uuid[])', [communityIds])
+    : { rows: [] as any[] };
+  const communityById = new Map<string, PostCommunity>(comms.map((c) => [c.id, { id: c.id, slug: c.slug, name: c.name, iconUrl: c.icon_url ?? null }]));
+  const nonPublic = new Set(comms.filter((c) => c.visibility !== 'public').map((c) => c.id as string));
+
+  // Paid / subscriber-only posts: who is entitled (author, staff who can view posts, buyers, active members)
+  const all0 = [...rows, ...originals];
+  const gated = all0.filter((r) => r.access && r.access !== 'public');
+  let unlocked = new Set<string>();
+  let memberOf = new Set<string>();
+  if (viewer && gated.length) {
+    const [u, m] = await Promise.all([
+      query<{ post_id: string }>('SELECT post_id FROM post_unlocks WHERE user_id = $1 AND post_id = ANY($2::uuid[])', [viewer.id, gated.filter((r) => r.access === 'paid').map((r) => r.id)]),
+      query<{ creator_id: string }>(
+        `SELECT creator_id FROM memberships WHERE member_id = $1 AND status IN ('active','canceled') AND current_period_end > now() AND creator_id = ANY($2::uuid[])`,
+        [viewer.id, [...new Set(gated.map((r) => r.author_id).filter(Boolean))]],
+      ),
+    ]);
+    unlocked = new Set(u.rows.map((r) => r.post_id));
+    memberOf = new Set(m.rows.map((r) => r.creator_id));
+  }
+  const staffCanView = !!viewer && isStaff(viewer.role) && viewer.permissions.includes('posts.view');
+  const entitled = (r: any) => {
+    if (!r.access || r.access === 'public') return true;
+    if (!viewer) return false;
+    if (r.author_id === viewer.id || staffCanView) return true;
+    if (r.access === 'paid') return unlocked.has(r.id) || memberOf.has(r.author_id);
+    return memberOf.has(r.author_id);
+  };
+  /** Apply the lock to a serialized post. */
+  const gate = <T extends PublicPost>(post: T, r: any): T & PostAccess => {
+    const access = (r.access ?? 'public') as PostAccess['access'];
+    const base = { access, priceMinor: r.price_minor != null ? Number(r.price_minor) : null, currency: r.currency ?? null, locked: false, lockedMediaCount: 0 };
+    if (entitled(r)) return { ...post, ...base };
+    const text = post.content ?? '';
+    return { ...post, ...base, content: text.length > 100 ? `${text.slice(0, 100).trimEnd()}…` : text, media: [], locked: true, lockedMediaCount: post.media.length };
+  };
 
   let saved = new Set<string>();
   let liked = new Set<string>();
@@ -80,27 +134,72 @@ export async function hydratePosts(rows: any[], viewer?: AuthUser): Promise<Hydr
     const target = r.is_share ? original : r;
     const owner = isOwner(r);
     return {
-      ...publicPost(r, { owner, liked: r.liked ?? liked.has(r.id) }),
+      ...gate(publicPost(r, { owner, liked: r.liked ?? liked.has(r.id) }), r),
       savedByMe: saved.has(r.id),
-      canShare: target ? shareAllowed(target, viewer, isOwner(target), friends) : false,
-      sharedPost: original ? publicPost(original, { owner: isOwner(original) }) : null,
+      // Pending posts and posts in private / invite-only communities can't be shared
+      canShare: target && !r.is_pending && (target.access ?? 'public') === 'public' && !(r.community_id && nonPublic.has(r.community_id))
+        ? shareAllowed(target, viewer, isOwner(target), friends) : false,
+      sharedPost: original ? gate(publicPost(original, { owner: isOwner(original) }), original) : null,
+      community: r.community_id ? (communityById.get(r.community_id) ?? null) : null,
+      isPinned: !!r.pinned_at,
+      isPending: !!r.is_pending,
     };
   });
 }
 
-/** Keyset-paginated feed. Anonymous rows have author_id NULL in the DB; the serializer double-enforces it. */
-export async function getFeed({ mode = 'all', cursor, limit = 20, q, authorId, viewer }: FeedOptions) {
-  const where = ['p.is_removed = false', 'p.deleted_at IS NULL', '(u.id IS NULL OR u.is_banned = false)'];
-  const params: unknown[] = [];
-  const add = (v: unknown) => { params.push(v); return `$${params.length}`; };
+/**
+ * Filters shared by every feed query (newest-first and ranked). `add` pushes a bind parameter.
+ * Hidden posts and snoozed people are left out of the main feeds (not of profiles or search).
+ * Returns null when the viewer can't have this feed at all (Communities feed while signed out).
+ */
+export function feedWhere({ mode = 'all', q, authorId, viewer, media }: FeedOptions, add: (v: unknown) => string): string[] | null {
+  const where = ['p.is_removed = false', 'p.deleted_at IS NULL', 'NOT p.is_pending', '(u.id IS NULL OR u.is_banned = false)'];
+
+  if (mode === 'communities' && !authorId) {
+    // Posts from communities you belong to (never anything you couldn't open yourself)
+    if (!viewer) return null;
+    where.push(`p.community_id IN (SELECT m.community_id FROM community_members m JOIN communities cm ON cm.id = m.community_id
+                 WHERE m.user_id = ${add(viewer.id)} AND cm.deleted_at IS NULL AND NOT cm.is_suspended)`);
+  } else {
+    // Main feed, search and profiles never include community posts — those live in their community
+    where.push('p.community_id IS NULL');
+  }
 
   if (authorId) {
     // Profile timeline: identity posts by this author ONLY. Anonymous posts can never match (author_id IS NULL).
     where.push(`p.visibility = 'identity'`, `p.author_id = ${add(authorId)}`);
-  } else if (mode !== 'all') {
+  } else if (mode === 'identity' || mode === 'anonymous') {
     where.push(`p.visibility = ${add(mode)}`);
   }
   if (q) where.push(`p.content ILIKE ${add(`%${q.replace(/[%_\\]/g, '\\$&')}%`)}`);
+  if (q) where.push(`p.access = 'public'`); // search must not reveal what's inside paid posts
+  if (media === 'video') where.push(`p.access = 'public'`);
+  if (media === 'video') where.push(`EXISTS (SELECT 1 FROM jsonb_array_elements(p.media) m WHERE m->>'type' = 'video')`);
+  if (viewer && !authorId && !q) {
+    const v = add(viewer.id);
+    where.push(`NOT EXISTS (SELECT 1 FROM post_hides h WHERE h.user_id = ${v} AND h.post_id = p.id)`);
+    where.push(`(p.author_id IS NULL OR NOT EXISTS (SELECT 1 FROM author_snoozes z WHERE z.user_id = ${v} AND z.author_id = p.author_id AND z.until > now()))`);
+  }
+  return where;
+}
+
+/**
+ * Feed entry point. The main feed, Reels and the Communities feed are RANKED (see feed-ranking.service.ts) unless
+ * sort=recent; profiles and search are newest first. Anonymous rows have author_id NULL in the DB.
+ */
+export async function getFeed(opts: FeedOptions) {
+  const ranked = !opts.authorId && !opts.q && opts.sort !== 'recent';
+  if (ranked && (!opts.cursor || opts.cursor.startsWith('r.'))) return rankedFeed(opts);
+  return recentFeed(opts);
+}
+
+/** Keyset-paginated, newest first. */
+export async function recentFeed(opts: FeedOptions) {
+  const { cursor, limit = 20, viewer } = opts;
+  const params: unknown[] = [];
+  const add = (v: unknown) => { params.push(v); return `$${params.length}`; };
+  const where = feedWhere(opts, add);
+  if (!where) return { posts: [], cursor: null, hasMore: false };
 
   const c = decodeCursor(cursor);
   if (c) where.push(`(p.created_at, p.id) < (${add(c.ts)}, ${add(c.id)})`);
@@ -183,6 +282,11 @@ export async function getSaved(viewer: AuthUser, cursor?: string, limit = 20) {
        JOIN posts p ON p.id = s.post_id
        LEFT JOIN users u ON u.id = p.author_id
       WHERE s.user_id = $1 AND p.is_removed = false AND p.deleted_at IS NULL AND (u.id IS NULL OR u.is_banned = false) ${cursorSql}
+        AND NOT p.is_pending
+        -- A saved community post stays visible only while you can still open it (public, or you're a member)
+        AND (p.community_id IS NULL OR EXISTS (
+              SELECT 1 FROM communities cm WHERE cm.id = p.community_id AND cm.deleted_at IS NULL AND NOT cm.is_suspended
+                AND (cm.visibility = 'public' OR EXISTS (SELECT 1 FROM community_members m WHERE m.community_id = cm.id AND m.user_id = $1))))
       ORDER BY s.created_at DESC, p.id DESC
       LIMIT $2`,
     params,

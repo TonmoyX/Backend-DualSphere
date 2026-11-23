@@ -10,6 +10,7 @@ import { initLimiters } from './middleware/rateLimit.middleware.js';
 import { mediaService } from './services/media.service.js';
 import { storyService } from './services/story.service.js';
 import { loadSettings } from './services/settings.service.js';
+import { runWorker } from './worker-tasks.js';
 
 async function main() {
   await pool.query('SELECT 1');
@@ -34,6 +35,9 @@ async function main() {
     }
   }, 10 * 60 * 1000);
   hourly.unref();
+
+  // Background worker inside the API process (dev convenience). In production run `npm run worker` separately.
+  if (env.WORKER_IN_PROCESS === 'true') runWorker();
 
   server.listen(env.PORT, () => {
     logger.info(`🚀 DualSphere API on http://localhost:${env.PORT}  (storage: ${storageDriver})`);

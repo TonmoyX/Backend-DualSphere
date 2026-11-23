@@ -11,6 +11,9 @@ import { mediaService } from './media.service.js';
 import { deleteObject } from '../lib/storage.js';
 import { notificationService } from './notification.service.js';
 import { getSettings } from './settings.service.js';
+import { announceCommunityPost, assertCommunityPostVisible, preparePostInCommunity } from './community.service.js';
+import { isActiveCreator, PRICE_MAX_MINOR, PRICE_MIN_MINOR } from './creator.service.js';
+import { env } from '../config/env.js';
 
 export const POST_SELECT = `
   SELECT p.*, u.username AS author_username, u.display_name AS author_display_name,
@@ -26,6 +29,9 @@ interface CreatePostInput {
   mode: Visibility;
   user: AuthUser;
   sharePolicy?: SharePolicy;
+  communityId?: string;
+  access?: 'public' | 'subscribers' | 'paid';
+  priceMinor?: number;
 }
 
 function assertPolicy(mode: Visibility, policy: SharePolicy) {
@@ -62,9 +68,20 @@ function assertCanPost(user: AuthUser, mode: Visibility) {
 }
 
 export const postService = {
-  async create({ content: raw, mediaIds, mode, user, sharePolicy = 'everyone' }: CreatePostInput) {
+  async create({ content: raw, mediaIds, mode, user, sharePolicy = 'everyone', communityId, access = 'public', priceMinor }: CreatePostInput) {
     assertCanPost(user, mode);
     assertPolicy(mode, sharePolicy);
+    // Paid / subscriber-only: creators, identity posts, outside communities (money and anonymity never touch)
+    if (access !== 'public') {
+      if (mode !== 'identity') throw badRequest('ANON_NOT_PAID', 'Anonymous posts can\'t be paid or subscriber-only');
+      if (communityId) throw badRequest('COMMUNITY_NOT_PAID', 'Community posts can\'t be paid or subscriber-only');
+      if (!(await isActiveCreator(user.id))) throw forbidden('NOT_CREATOR', 'Turn on creator tools to post paid or subscriber-only content');
+      if (access === 'paid' && (!priceMinor || priceMinor < PRICE_MIN_MINOR || priceMinor > PRICE_MAX_MINOR)) throw badRequest('BAD_PRICE', 'Set a price for the paid post');
+      sharePolicy = 'none'; // paid content can't be re-shared
+    }
+    // Community post: membership, bans, mutes and the community's anonymous policy are checked first
+    const community = communityId ? await preparePostInCommunity(communityId, user, mode) : null;
+    const pending = !!community?.pending;
     const s = getSettings();
     const content = cleanText(raw);
     if (content.length > s.limits.maxPostLength) throw badRequest('TOO_LONG', `Posts are limited to ${s.limits.maxPostLength} characters`);
@@ -79,8 +96,8 @@ export const postService = {
 
     const post = await tx(async (c) => {
       const { rows } = await c.query(
-        `INSERT INTO posts (content, media, visibility, author_id, content_hash, abuse_flags, share_policy)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        `INSERT INTO posts (content, media, visibility, author_id, content_hash, abuse_flags, share_policy, community_id, is_pending, access, price_minor, currency)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
         [
           content,
           JSON.stringify(media.map((m) => ({ id: m.id, url: m.url, type: m.kind, mime: m.mime }))),
@@ -88,21 +105,37 @@ export const postService = {
           mode === 'identity' ? user.id : null, // ← CRITICAL: anonymous posts have NO author
           verdict.hash,
           verdict.flags,
-          sharePolicy,
+          // Posts in non-public communities can't be shared outside them
+          community && community.community.visibility !== 'public' ? 'none' : sharePolicy,
+          community ? community.community.id : null,
+          pending,
+          access,
+          access === 'paid' ? priceMinor : null,
+          access === 'paid' ? env.DEFAULT_CURRENCY : null,
         ],
       );
       const p = rows[0];
 
       // 3. Anonymous: identity goes ONLY to the encrypted link table
       if (mode === 'anonymous') await identityService.storeLink(c, p.id, user.id);
+      // Community posts don't count toward the profile (they never show there)
+      else if (community) await c.query('UPDATE users SET abuse_score = abuse_score + $2 WHERE id = $1', [user.id, verdict.score]);
       else await c.query('UPDATE users SET post_count = post_count + 1, abuse_score = abuse_score + $2 WHERE id = $1', [user.id, verdict.score]);
+      if (community && !pending) await c.query('UPDATE communities SET post_count = post_count + 1 WHERE id = $1', [community.community.id]);
 
       // 4. Attach media; for anon posts the media row's owner is wiped (no user↔post trail)
       await mediaService.attach(c, media.map((m) => m.id), p.id, mode === 'anonymous');
       return p;
     });
 
-    const full = await broadcastNew(post.id);
+    let full: any;
+    if (community) {
+      // Never broadcast community posts to the global feed — only to the community's own room
+      full = await one(`${POST_SELECT} WHERE p.id = $1`, [post.id]);
+      await announceCommunityPost(community.community.id, (await hydratePosts([full]))[0], pending);
+    } else {
+      full = await broadcastNew(post.id);
+    }
     if (verdict.flags.length) emit.staff('admin:flagged', { postId: post.id, flags: verdict.flags });
     if (mode === 'anonymous') joinAnonPostRoom(user.id, post.id); // live activity alerts for the hidden author
     return (await hydratePosts([full], user))[0];
@@ -114,6 +147,13 @@ export const postService = {
     if (row.is_share && !row.shared_post_id) throw notFound('Post');
     const root = row.is_share ? await this.getVisible(row.shared_post_id, user) : row;
     if (root.is_removed) throw notFound('Post');
+    if (root.is_pending) throw forbidden('SHARE_NOT_ALLOWED', 'This post is waiting for approval');
+    if (root.access && root.access !== 'public') throw forbidden('SHARE_NOT_ALLOWED', 'Paid and subscriber-only posts can\'t be shared');
+    // Only posts from public communities can be shared to the main feed
+    if (root.community_id) {
+      const c = await one('SELECT visibility FROM communities WHERE id = $1', [root.community_id]);
+      if (c?.visibility !== 'public') throw forbidden('SHARE_NOT_ALLOWED', 'Posts from private communities can\'t be shared');
+    }
     const [h] = await hydratePosts([root], user);
     if (!h!.canShare) {
       throw forbidden('SHARE_NOT_ALLOWED', root.share_policy === 'friends' ? 'Only the author\'s friends can share this post' : 'The author turned off sharing for this post');
@@ -154,10 +194,15 @@ export const postService = {
   },
 
   async setSharePolicy(postId: string, user: AuthUser, sharePolicy: SharePolicy) {
-    const row = await one('SELECT id, visibility, author_id, is_share FROM posts WHERE id = $1 AND deleted_at IS NULL', [postId]);
+    const row = await one('SELECT id, visibility, author_id, is_share, community_id, access FROM posts WHERE id = $1 AND deleted_at IS NULL', [postId]);
     if (!row) throw notFound('Post');
     if (!(await isOwnerOf(row, user))) throw forbidden('NOT_OWNER', 'Only the author can change who can share this post');
+    if (row.community_id) {
+      const c = await one('SELECT visibility FROM communities WHERE id = $1', [row.community_id]);
+      if (c?.visibility !== 'public') throw badRequest('COMMUNITY_PRIVATE', 'Posts in private communities can\'t be shared outside');
+    }
     if (row.is_share) throw badRequest('IS_SHARE', 'Sharing settings belong to the original post');
+    if (row.access !== 'public') throw badRequest('PAID_POST', 'Paid and subscriber-only posts can\'t be shared');
     assertPolicy(row.visibility, sharePolicy);
     await query('UPDATE posts SET share_policy = $2 WHERE id = $1', [postId, sharePolicy]);
     emit.feed('post:update', { id: postId, sharePolicy });
@@ -180,6 +225,8 @@ export const postService = {
       [postId],
     );
     if (!row || (row.is_removed && !['moderator', 'admin'].includes(viewer?.role ?? ''))) throw notFound('Post');
+    // Private / invite-only community posts: members only (covers the post page, comments, likes, saves and shares)
+    await assertCommunityPostVisible(row, viewer);
     return row;
   },
 
@@ -190,7 +237,7 @@ export const postService = {
   },
 
   async remove(postId: string, user: AuthUser) {
-    const row = await one('SELECT id, visibility, author_id, is_share, shared_post_id, media FROM posts WHERE id = $1 AND deleted_at IS NULL', [postId]);
+    const row = await one('SELECT id, visibility, author_id, is_share, shared_post_id, media, community_id, is_pending FROM posts WHERE id = $1 AND deleted_at IS NULL', [postId]);
     if (!row) throw notFound('Post');
     if (!(await isOwnerOf(row, user))) throw forbidden('NOT_OWNER', 'You can only delete your own posts');
 
@@ -208,7 +255,9 @@ export const postService = {
       );
       await c.query('DELETE FROM posts WHERE id = $1', [postId]);
       await c.query('DELETE FROM media WHERE id = ANY($1::uuid[])', [media.map((m) => m.id)]);
-      if (row.visibility === 'identity') await c.query('UPDATE users SET post_count = GREATEST(post_count - 1, 0) WHERE id = $1', [user.id]);
+      if (row.community_id) {
+        if (!row.is_pending) await c.query('UPDATE communities SET post_count = GREATEST(post_count - 1, 0) WHERE id = $1', [row.community_id]);
+      } else if (row.visibility === 'identity') await c.query('UPDATE users SET post_count = GREATEST(post_count - 1, 0) WHERE id = $1', [user.id]);
       if (row.is_share && row.shared_post_id) {
         const { rows } = await c.query('UPDATE posts SET shares_count = GREATEST(shares_count - 1, 0) WHERE id = $1 RETURNING shares_count', [row.shared_post_id]);
         if (rows[0]) emit.feed('post:update', { id: row.shared_post_id, sharesCount: rows[0].shares_count });
@@ -217,7 +266,8 @@ export const postService = {
     });
     for (const f of files) await deleteObject(f.object_key, f.storage);
     for (const u of (row.media ?? []) as { url: string }[]) await mediaService.releaseIfUnused(u.url);
-    emit.feed('post:removed', { id: postId });
+    if (row.community_id) emit.community(row.community_id, 'post:removed', { id: postId });
+    else emit.feed('post:removed', { id: postId });
   },
 
   async toggleLike(postId: string, user: AuthUser) {

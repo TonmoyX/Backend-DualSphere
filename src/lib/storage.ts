@@ -10,6 +10,8 @@ const s3 = r2Enabled
   ? new S3Client({
       region: 'auto',
       endpoint: `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      // Path-style (`<account>.r2…/<bucket>/key`) avoids a per-bucket DNS lookup that can fail intermittently.
+      forcePathStyle: true,
       credentials: { accessKeyId: env.R2_ACCESS_KEY_ID!, secretAccessKey: env.R2_SECRET_ACCESS_KEY! },
     })
   : null;

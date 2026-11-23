@@ -126,7 +126,14 @@ export const moderationService = {
     if (!p) throw notFound('Post');
     if (p.is_removed) return;
     await tx(async (c) => {
-      await c.query('UPDATE posts SET is_removed = true, removed_reason = $2 WHERE id = $1', [postId, reason]);
+      // Removing a flagged post also closes its abuse flag
+      await c.query(
+        `UPDATE posts SET is_removed = true, removed_reason = $2,
+                abuse_reviewed_at = CASE WHEN cardinality(abuse_flags) > 0 THEN coalesce(abuse_reviewed_at, now()) END,
+                abuse_reviewed_by = CASE WHEN cardinality(abuse_flags) > 0 THEN coalesce(abuse_reviewed_by, $3) END
+          WHERE id = $1`,
+        [postId, reason, actor.id],
+      );
       await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'POST_REMOVE', targetId: postId, targetType: 'post', metadata: { reason } }, c);
     });
     if (p.visibility === 'identity' && p.author_id) {
@@ -136,7 +143,14 @@ export const moderationService = {
   },
 
   async restorePost(postId: string, actor: AuthUser) {
-    const r = await query('UPDATE posts SET is_removed = false, removed_reason = NULL WHERE id = $1 RETURNING id', [postId]);
+    // A moderator restoring a flagged post has reviewed it — keep the flag closed
+    const r = await query(
+      `UPDATE posts SET is_removed = false, removed_reason = NULL,
+              abuse_reviewed_at = CASE WHEN cardinality(abuse_flags) > 0 THEN coalesce(abuse_reviewed_at, now()) END,
+              abuse_reviewed_by = CASE WHEN cardinality(abuse_flags) > 0 THEN coalesce(abuse_reviewed_by, $2) END
+        WHERE id = $1 RETURNING id`,
+      [postId, actor.id],
+    );
     if (!r.rowCount) throw notFound('Post');
     await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'POST_RESTORE', targetId: postId, targetType: 'post' });
   },
@@ -178,10 +192,11 @@ export const moderationService = {
       await c.query('UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [userId]);
       await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'USER_BAN', targetId: userId, targetType: 'user', metadata: { reason, until } }, c);
     });
-    emit.user(userId, 'session:revoked', { reason: 'banned' });
+    emit.revoke(userId, { reason: 'banned' });
   },
 
   async unbanUser(userId: string, actor: AuthUser) {
+    await this.assertOutranks(actor, userId); // a moderator can't lift a ban on another staff account
     const r = await query('UPDATE users SET is_banned = false, ban_reason = NULL, banned_until = NULL WHERE id = $1 RETURNING id', [userId]);
     if (!r.rowCount) throw notFound('User');
     await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'USER_UNBAN', targetId: userId, targetType: 'user' });

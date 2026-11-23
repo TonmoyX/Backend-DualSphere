@@ -112,8 +112,24 @@ export function initRealtime(server: HttpServer) {
       void joinOwnAnonRooms(socket, u.id);
     }
 
-    socket.on('post:watch', (postId: unknown) => {
-      if (typeof postId === 'string' && /^[0-9a-f-]{36}$/i.test(postId)) socket.join(`post:${postId}`);
+    // Live comments for a post. Community posts are checked first, so private-community comments never reach outsiders.
+    socket.on('post:watch', async (postId: unknown) => {
+      if (typeof postId !== 'string' || !/^[0-9a-f-]{36}$/i.test(postId)) return;
+      try {
+        const { canWatchPost } = await import('../services/community.service.js'); // lazy: avoids an import cycle
+        if (await canWatchPost(postId, await socketViewer(socket))) socket.join(`post:${postId}`);
+      } catch { /* best-effort */ }
+    });
+    // Live posts for a community page — members only for private / invite-only communities
+    socket.on('community:watch', async (communityId: unknown) => {
+      if (typeof communityId !== 'string' || !/^[0-9a-f-]{36}$/i.test(communityId)) return;
+      try {
+        const { canWatchCommunity } = await import('../services/community.service.js');
+        if (await canWatchCommunity(communityId, await socketViewer(socket))) socket.join(`community:${communityId}`);
+      } catch { /* best-effort */ }
+    });
+    socket.on('community:unwatch', (communityId: unknown) => {
+      if (typeof communityId === 'string') socket.leave(`community:${communityId}`);
     });
     socket.on('post:unwatch', (postId: unknown) => {
       if (typeof postId === 'string') socket.leave(`post:${postId}`);
@@ -159,6 +175,22 @@ function broadcastStaffPresence() {
   }, 1000);
 }
 
+/**
+ * The signed-in user behind a socket, in the AuthUser shape the access checks expect.
+ * Re-read from the database on each check so role/permission/ban changes apply immediately.
+ */
+async function socketViewer(socket: Socket): Promise<import('../types/index.js').AuthUser | undefined> {
+  const u = socket.data.user as { id: string } | undefined;
+  if (!u) return undefined;
+  const row = await one<any>('SELECT id, role, username, is_verified, mfa_enabled, created_at, permissions, is_banned FROM users WHERE id = $1', [u.id]);
+  if (!row || row.is_banned) return undefined;
+  const { effectivePermissions } = await import('./permissions.js');
+  return {
+    id: row.id, sessionId: '', role: row.role, username: row.username, isVerified: !!row.is_verified, mfaEnabled: !!row.mfa_enabled,
+    createdAt: row.created_at, permissions: effectivePermissions(row.role, row.permissions),
+  };
+}
+
 export function onlineCount() {
   return io?.engine.clientsCount ?? 0;
 }
@@ -166,6 +198,7 @@ export function onlineCount() {
 export const emit = {
   feed: (event: string, payload: unknown) => io?.to('feed').emit(event, payload),
   post: (postId: string, event: string, payload: unknown) => io?.to(`post:${postId}`).emit(event, payload),
+  community: (communityId: string, event: string, payload: unknown) => io?.to(`community:${communityId}`).emit(event, payload),
   user: (userId: string, event: string, payload: unknown) => io?.to(`user:${userId}`).emit(event, payload),
   users: (userIds: string[], event: string, payload: unknown) => {
     if (io && userIds.length) io.to(userIds.map((id) => `user:${id}`)).emit(event, payload);
@@ -174,6 +207,14 @@ export const emit = {
   all: (event: string, payload: unknown) => io?.emit(event, payload),
   /** Live alerts for the hidden author of an anonymous post (room membership is in memory only). */
   anonPost: (postId: string, event: string, payload: unknown) => io?.to(`anonpost:${postId}`).emit(event, payload),
+  /**
+   * Session ended (ban, role change, revoke, delete): tell the user's tabs, then drop their sockets so
+   * nothing keeps the old identity/role — e.g. a demoted moderator staying in the staff room.
+   */
+  revoke: (userId: string, payload: unknown) => {
+    io?.to(`user:${userId}`).emit('session:revoked', payload);
+    setTimeout(() => io?.in(`user:${userId}`).disconnectSockets(true), 500).unref();
+  },
 };
 
 /** Put a user's open tabs in the room of an anonymous post they just created (ownership already known). */

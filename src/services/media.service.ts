@@ -6,6 +6,7 @@ import { badRequest, forbidden, notFound } from '../lib/errors.js';
 import { signUploadToken } from '../lib/jwt.js';
 import { logger } from '../lib/logger.js';
 import { deleteObject, headObject, presignPut, publicUrlFor, putObject, storageDriver } from '../lib/storage.js';
+import { emit } from '../lib/realtime.js';
 import { getSettings } from './settings.service.js';
 
 const MIME: Record<string, { ext: string; kind: 'image' | 'video' | 'audio' }> = {
@@ -58,14 +59,45 @@ const mapMedia = (m: any) => ({
   storage: m.storage, createdAt: m.created_at, postId: m.post_id, ownerId: m.owner_id,
 });
 
+/**
+ * Permanently delete posts that have nothing left to show: no text and no files. Shares are kept (they show the
+ * original post). Same clean-up as a normal delete: reports, counters, remaining files, live removal from feeds.
+ */
+export async function deleteEmptyPosts(postIds: string[]) {
+  if (!postIds.length) return [] as string[];
+  const { rows } = await query<{ id: string; visibility: string; author_id: string | null; community_id: string | null; is_pending: boolean }>(
+    `SELECT id, visibility, author_id, community_id, is_pending FROM posts
+      WHERE id = ANY($1::uuid[]) AND NOT is_share AND btrim(COALESCE(content, '')) = '' AND jsonb_array_length(COALESCE(media, '[]'::jsonb)) = 0`,
+    [postIds],
+  );
+  for (const p of rows) {
+    const { rows: files } = await query<{ object_key: string; storage: 'r2' | 'local' }>('DELETE FROM media WHERE post_id = $1 RETURNING object_key, storage', [p.id]);
+    await query(
+      `DELETE FROM reports WHERE (target_type = 'post' AND target_id = $1)
+          OR (target_type = 'comment' AND target_id IN (SELECT id FROM comments WHERE post_id = $1))`,
+      [p.id],
+    );
+    await query('DELETE FROM posts WHERE id = $1', [p.id]);
+    if (p.community_id) {
+      if (!p.is_pending) await query('UPDATE communities SET post_count = GREATEST(post_count - 1, 0) WHERE id = $1', [p.community_id]);
+      emit.community(p.community_id, 'post:removed', { id: p.id });
+    } else {
+      if (p.visibility === 'identity' && p.author_id) await query('UPDATE users SET post_count = GREATEST(post_count - 1, 0) WHERE id = $1', [p.author_id]);
+      emit.feed('post:removed', { id: p.id });
+    }
+    for (const f of files) await deleteObject(f.object_key, f.storage).catch(() => {});
+  }
+  return rows.map((r) => r.id);
+}
+
 export const mediaService = {
   /** Step 1: reserve an object key and return a direct-upload URL (R2 presigned PUT, or signed local URL). */
-  async presign(userId: string, input: { filename: string; contentType: string; size: number; purpose: 'post' | 'avatar' | 'cover' | 'message' | 'story' }) {
+  async presign(userId: string, input: { filename: string; contentType: string; size: number; purpose: 'post' | 'avatar' | 'cover' | 'message' | 'story' | 'community' | 'ad' }) {
     const s = getSettings();
     if (!s.features.mediaUploadsEnabled) throw forbidden('UPLOADS_DISABLED', 'Media uploads are disabled');
     const info = MIME[input.contentType];
     if (!info) throw badRequest('UNSUPPORTED_TYPE', 'Supported: JPG, PNG, WebP, GIF, AVIF, MP4, WebM, MOV');
-    if (info.kind === 'video' && (!s.features.videoUploadsEnabled || !['post', 'message', 'story'].includes(input.purpose))) {
+    if (info.kind === 'video' && (!s.features.videoUploadsEnabled || !['post', 'message', 'story', 'ad'].includes(input.purpose))) {
       throw forbidden('VIDEO_DISABLED', 'Video uploads are not allowed here');
     }
     if (info.kind === 'audio' && input.purpose !== 'message') throw forbidden('AUDIO_NOT_ALLOWED', 'Audio is only allowed in messages');
@@ -148,6 +180,37 @@ export const mediaService = {
     await c.query(`UPDATE media SET status = 'attached', message_id = $2 WHERE id = ANY($1::uuid[])`, [ids, messageId]);
   },
 
+  /**
+   * Ad creative media (purpose "ad"): ready uploads by this user. Marked attached so cleanup never deletes them.
+   * Returns the public shape stored on the creative.
+   */
+  async claimableForAd(ids: string[], userId: string) {
+    if (ids.length === 0) return [];
+    const { rows } = await query(
+      `SELECT id, url, kind, mime FROM media WHERE id = ANY($1::uuid[]) AND owner_id = $2 AND status IN ('ready','attached') AND purpose = 'ad' AND kind IN ('image','video')`,
+      [ids, userId],
+    );
+    if (rows.length !== new Set(ids).size) throw badRequest('INVALID_MEDIA', 'One or more ad files are invalid or still uploading');
+    await query(`UPDATE media SET status = 'attached' WHERE id = ANY($1::uuid[])`, [ids]);
+    return ids.map((id) => { const r = rows.find((x) => x.id === id)!; return { id: r.id, url: r.url, type: r.kind, mime: r.mime }; });
+  },
+
+  /** Business logo (purpose "ad", image). */
+  async useForAd(userId: string, mediaId: string) {
+    const m = await one(`SELECT * FROM media WHERE id = $1 AND owner_id = $2 AND status = 'ready' AND purpose = 'ad' AND kind = 'image'`, [mediaId, userId]);
+    if (!m) throw badRequest('INVALID_MEDIA', 'Upload the image first');
+    await query(`UPDATE media SET status = 'attached' WHERE id = $1`, [mediaId]);
+    return m.url as string;
+  },
+
+  /** Community icon / banner: a ready image this user uploaded with purpose "community". */
+  async useForCommunity(userId: string, mediaId: string) {
+    const m = await one(`SELECT * FROM media WHERE id = $1 AND owner_id = $2 AND status = 'ready' AND purpose = 'community' AND kind = 'image'`, [mediaId, userId]);
+    if (!m) throw badRequest('INVALID_MEDIA', 'Upload the image first');
+    await query(`UPDATE media SET status = 'attached' WHERE id = $1`, [mediaId]);
+    return m.url as string;
+  },
+
   /** Avatar / cover: returns URL of a ready media row owned by the user. */
   async useForProfile(userId: string, mediaId: string, purpose: 'avatar' | 'cover') {
     const m = await one(`SELECT * FROM media WHERE id = $1 AND owner_id = $2 AND status = 'ready' AND purpose = $3 AND kind = 'image'`, [mediaId, userId, purpose]);
@@ -167,7 +230,10 @@ export const mediaService = {
     const used = await one(
       `SELECT 1 WHERE EXISTS (SELECT 1 FROM users WHERE avatar_url = $1 OR cover_url = $1)
           OR EXISTS (SELECT 1 FROM posts WHERE media @> jsonb_build_array(jsonb_build_object('url', $1::text)))
-          OR EXISTS (SELECT 1 FROM stories WHERE media_url = $1)`,
+          OR EXISTS (SELECT 1 FROM stories WHERE media_url = $1)
+          OR EXISTS (SELECT 1 FROM communities WHERE icon_url = $1 OR banner_url = $1)
+          OR EXISTS (SELECT 1 FROM business_pages WHERE logo_url = $1)
+          OR EXISTS (SELECT 1 FROM ad_creatives WHERE media @> jsonb_build_array(jsonb_build_object('url', $1::text)))`,
       [url],
     );
     if (used) return;
@@ -190,16 +256,19 @@ export const mediaService = {
     const m = await one('SELECT * FROM media WHERE id = $1', [mediaId]);
     if (!m) throw notFound('Media');
     await deleteObject(m.object_key, m.storage);
-    if (m.post_id) {
-      await query(
-        `UPDATE posts SET media = coalesce((SELECT jsonb_agg(x) FROM jsonb_array_elements(media) x WHERE x->>'id' <> $2), '[]'::jsonb) WHERE id = $1`,
-        [m.post_id, mediaId],
-      );
-    }
+    // Take the file out of every post that shows it (its own post, and e.g. "updated profile picture" posts)
+    const { rows: touched } = await query<{ id: string }>(
+      `UPDATE posts SET media = coalesce((SELECT jsonb_agg(x) FROM jsonb_array_elements(media) x WHERE x->>'id' <> $2 AND x->>'url' <> $3), '[]'::jsonb)
+        WHERE id = $1 OR media @> jsonb_build_array(jsonb_build_object('id', $2::text)) OR media @> jsonb_build_array(jsonb_build_object('url', $3::text))
+        RETURNING id`,
+      [m.post_id, mediaId, m.url],
+    );
     await query('UPDATE users SET avatar_url = NULL WHERE avatar_url = $1', [m.url]);
     await query('UPDATE users SET cover_url = NULL WHERE cover_url = $1', [m.url]);
     await query('DELETE FROM media WHERE id = $1', [mediaId]);
-    return m;
+    // A post left with no text and no files is deleted entirely (no blank posts in feeds)
+    const removed = await deleteEmptyPosts(touched.map((t) => t.id));
+    return { ...m, removedPosts: removed };
   },
 
   /** Background job: drop abandoned uploads older than 24h. */

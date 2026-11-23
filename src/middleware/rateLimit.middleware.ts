@@ -24,7 +24,7 @@ function make(prefix: string, opts: Partial<Options>): RequestHandler {
   });
 }
 
-let limiters: Record<'global' | 'auth' | 'post' | 'anon' | 'comment' | 'report' | 'upload' | 'message' | 'friend', RequestHandler> | null = null;
+let limiters: Record<'global' | 'auth' | 'post' | 'anon' | 'comment' | 'report' | 'upload' | 'message' | 'friend' | 'community' | 'payment' | 'adEvent' | 'aiJob', RequestHandler> | null = null;
 
 /** Must run after Redis connects (stores are bound at creation). Limits read live from admin settings. */
 export function initLimiters() {
@@ -71,6 +71,14 @@ export function initLimiters() {
     friend: make('friend', { windowMs: 60 * 60 * 1000, limit: 100, keyGenerator: (req) => `u:${req.user?.id ?? ip(req)}`, message: 'Too many friend requests — try again later.' }),
     report: make('report', { windowMs: HOUR, limit: 30, keyGenerator: (req) => `u:${req.user?.id ?? ip(req)}` }),
     upload: make('upload', { windowMs: HOUR, limit: 60, keyGenerator: (req) => `u:${req.user?.id ?? ip(req)}` }),
+    // Community writes (create, join, settings, moderation): generous for real use, blocks scripted abuse
+    // Money: checkouts, payout requests, KYC, payout methods
+    payment: make('payment', { windowMs: HOUR, limit: 40, keyGenerator: (req) => `u:${req.user?.id ?? ip(req)}`, message: 'Too many payment requests — try again later.' }),
+    // Ad impression / click beacons (deduped server-side as well)
+    adEvent: make('adEvent', { windowMs: 60 * 1000, limit: 120, keyGenerator: (req) => `u:${req.user?.id ?? ip(req)}` }),
+    // AI Ad Studio jobs cost real money: tight per-user limit on top of the daily quota
+    aiJob: make('aiJob', { windowMs: HOUR, limit: 10, keyGenerator: (req) => `u:${req.user?.id ?? ip(req)}`, message: 'Too many AI jobs — try again later.' }),
+    community: make('community', { windowMs: HOUR, limit: 200, keyGenerator: (req) => `u:${req.user?.id ?? ip(req)}`, message: 'Too many community actions — try again later.' }),
   };
 }
 
@@ -86,3 +94,7 @@ export const reportLimiter = lazy('report');
 export const uploadLimiter = lazy('upload');
 export const messageLimiter = lazy('message');
 export const friendLimiter = lazy('friend');
+export const communityLimiter = lazy('community');
+export const paymentLimiter = lazy('payment');
+export const adEventLimiter = lazy('adEvent');
+export const aiJobLimiter = lazy('aiJob');

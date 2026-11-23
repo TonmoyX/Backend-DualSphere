@@ -3,10 +3,12 @@ import { z } from 'zod';
 import { badRequest } from '../lib/errors.js';
 import { verifyUploadToken } from '../lib/jwt.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
-import { reportLimiter, uploadLimiter } from '../middleware/rateLimit.middleware.js';
+import { friendLimiter, reportLimiter, uploadLimiter } from '../middleware/rateLimit.middleware.js';
 import { validate } from '../middleware/validate.middleware.js';
 import { commentService } from '../services/comment.service.js';
 import { getFeed, getMyAnonymous, getSaved } from '../services/feed.service.js';
+import { markSeen } from '../services/feed-ranking.service.js';
+import { query } from '../config/db.js';
 import { mediaService } from '../services/media.service.js';
 import { notificationService } from '../services/notification.service.js';
 import { postService } from '../services/post.service.js';
@@ -19,6 +21,37 @@ import { env } from '../config/env.js';
 export const feedRoutes = Router();
 feedRoutes.get('/', validate({ query: v.feedQuery }), async (req, res) => {
   res.json(await getFeed({ ...req.validated!.query, viewer: req.user }));
+});
+
+// Posts the viewer saw in the feed — ranking pushes them down next time (POST /feed/seen)
+const uuidList = z.array(z.string().uuid()).min(1).max(50);
+feedRoutes.post('/seen', requireAuth, validate({ body: z.object({ postIds: uuidList }).strict() }), async (req, res) => {
+  await markSeen(req.user!.id, req.body.postIds);
+  res.status(204).end();
+});
+// "Hide post" (and undo)
+feedRoutes.post('/hide/:id', requireAuth, validate({ params: v.idParam }), async (req, res) => {
+  await query('INSERT INTO post_hides (user_id, post_id) SELECT $1, id FROM posts WHERE id = $2 ON CONFLICT DO NOTHING', [req.user!.id, req.validated!.params.id]);
+  res.json({ ok: true });
+});
+feedRoutes.delete('/hide/:id', requireAuth, validate({ params: v.idParam }), async (req, res) => {
+  await query('DELETE FROM post_hides WHERE user_id = $1 AND post_id = $2', [req.user!.id, req.validated!.params.id]);
+  res.json({ ok: true });
+});
+// "Snooze <person> for 30 days" (and undo). Only real (identity) authors can be snoozed.
+feedRoutes.post('/snooze/:id', requireAuth, validate({ params: v.idParam }), async (req, res) => {
+  if (req.validated!.params.id === req.user!.id) throw badRequest('SELF', "You can't snooze yourself");
+  const r = await query(
+    `INSERT INTO author_snoozes (user_id, author_id, until) SELECT $1, id, now() + interval '30 days' FROM users WHERE id = $2
+     ON CONFLICT (user_id, author_id) DO UPDATE SET until = EXCLUDED.until RETURNING until`,
+    [req.user!.id, req.validated!.params.id],
+  );
+  if (!r.rowCount) throw badRequest('NOT_FOUND', 'User not found');
+  res.json({ ok: true, until: r.rows[0].until });
+});
+feedRoutes.delete('/snooze/:id', requireAuth, validate({ params: v.idParam }), async (req, res) => {
+  await query('DELETE FROM author_snoozes WHERE user_id = $1 AND author_id = $2', [req.user!.id, req.validated!.params.id]);
+  res.json({ ok: true });
 });
 
 // Your own anonymous posts — only ever for yourself (GET /feed/my-anonymous)
@@ -47,6 +80,18 @@ userRoutes.get('/:username', validate({ params: z.object({ username: v.username 
 });
 userRoutes.get('/:username/friends', validate({ params: z.object({ username: v.username }) }), async (req, res) => {
   res.json(await userService.friendsOf(req.validated!.params.username, req.user));
+});
+userRoutes.get('/:username/followers', validate({ params: z.object({ username: v.username }) }), async (req, res) => {
+  res.json(await userService.followList(req.validated!.params.username, 'followers', req.user));
+});
+userRoutes.get('/:username/following', validate({ params: z.object({ username: v.username }) }), async (req, res) => {
+  res.json(await userService.followList(req.validated!.params.username, 'following', req.user));
+});
+userRoutes.post('/:username/follow', requireAuth, friendLimiter, validate({ params: z.object({ username: v.username }) }), async (req, res) => {
+  res.json(await userService.follow(req.validated!.params.username, req.user!, true));
+});
+userRoutes.delete('/:username/follow', requireAuth, validate({ params: z.object({ username: v.username }) }), async (req, res) => {
+  res.json(await userService.follow(req.validated!.params.username, req.user!, false));
 });
 userRoutes.post('/:username/report', requireAuth, reportLimiter, validate({ params: z.object({ username: v.username }), body: v.reportSchema }), async (req, res) => {
   res.status(201).json(await userService.report(req.validated!.params.username, req.user!, req.body.reason, req.body.details));

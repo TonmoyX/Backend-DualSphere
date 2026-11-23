@@ -57,6 +57,33 @@ const schema = z.object({
   SEED_MODERATOR_EMAIL: z.string().default('mod@dualsphere.local'),
   SEED_MODERATOR_USERNAME: z.string().default('moderator'),
   SEED_MODERATOR_PASSWORD: z.string().default('ModPass!2026'),
+
+  // ── DualSphere Next: money (Phase 2) ──
+  // Encrypts payout details + KYC numbers. If unset, a sub-key is derived from IDENTITY_ENC_KEY.
+  FINANCE_ENC_KEY: hex32.optional(),
+  // The whole money system runs in US dollars (amounts in cents)
+  DEFAULT_CURRENCY: z.enum(['USD']).default('USD'),
+  PLATFORM_FEE_BPS: z.coerce.number().int().min(0).max(5000).default(1000), // 1000 = 10%
+  PAYOUT_HOLD_DAYS: z.coerce.number().int().min(0).max(90).default(7), // refund window before earnings unlock
+  PAYOUT_MIN_MINOR: z.coerce.number().int().min(0).default(1_000), // $10
+  PAYOUT_ADMIN_THRESHOLD_MINOR: z.coerce.number().int().min(0).default(50_000), // above $500 → admin approval
+  // Local test checkout. NEVER honoured in production, whatever this says.
+  PAYMENTS_TEST_MODE: z.enum(['true', 'false']).default('false'),
+  STRIPE_SECRET_KEY: z.string().optional(),
+  STRIPE_WEBHOOK_SECRET: z.string().optional(),
+  SSLCOMMERZ_STORE_ID: z.string().optional(),
+  SSLCOMMERZ_STORE_PASSWORD: z.string().optional(),
+  SSLCOMMERZ_SANDBOX: z.enum(['true', 'false']).default('true'),
+
+  // ── DualSphere Next: ads + AI (Phase 3) ──
+  ADS_MIN_DAILY_BUDGET_MINOR: z.coerce.number().int().min(0).default(500), // $5
+  ANTHROPIC_API_KEY: z.string().optional(),
+  AI_MODEL_COPY: z.string().optional(),
+  AI_JOBS_PER_DAY: z.coerce.number().int().min(0).max(1000).default(10),
+  AI_MAX_VIDEO_SEC: z.coerce.number().int().min(5).max(600).default(90),
+  FFMPEG_PATH: z.string().optional(),
+  // Run the background worker inside the API process (handy in development; use `npm run worker` in production)
+  WORKER_IN_PROCESS: z.enum(['true', 'false']).default('false'),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -72,3 +99,6 @@ export const corsOrigins = env.CORS_ORIGINS.split(',').map((s) => s.trim()).filt
 export const r2Enabled = Boolean(
   env.R2_ACCOUNT_ID && env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY && env.R2_BUCKET && env.R2_PUBLIC_URL,
 );
+
+/** Payments test checkout: only ever outside production. */
+export const paymentsTestMode = env.PAYMENTS_TEST_MODE === 'true' && env.NODE_ENV !== 'production';
