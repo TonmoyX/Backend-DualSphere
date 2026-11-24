@@ -2,6 +2,7 @@
 import { processStudioJob } from './services/ad-studio.service.js';
 import { billAdSpend, completeCampaigns, optimizeCreatives, rollupAdMetrics } from './services/ads.service.js';
 import { cleanupFeedSessions } from './services/feed-ranking.service.js';
+import { purgeMessageArchive } from './services/investigation.service.js';
 import { startWorker } from './services/jobs.service.js';
 import { expireMemberships, expireStaleCheckouts, releaseHeldEarnings } from './services/payment.service.js';
 
@@ -19,6 +20,7 @@ export function runWorker() {
       { name: 'ad-complete', everyMs: 5 * MIN, run: completeCampaigns },
       { name: 'feed-cleanup', everyMs: 60 * MIN, run: cleanupFeedSessions },
       { name: 'ad-optimize', everyMs: 60 * MIN, run: optimizeCreatives },
+      { name: 'message-archive-purge', everyMs: 60 * MIN, run: purgeMessageArchive }, // 90-day retention
     ],
   );
 }

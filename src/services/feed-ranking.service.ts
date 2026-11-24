@@ -12,6 +12,8 @@
 // ═══════════════════════════════════════════════════════════════
 import { query } from '../config/db.js';
 import { encodeCursor } from '../lib/serialize.js';
+import { emit } from '../lib/realtime.js';
+import { identityService } from './identity.service.js';
 import { type FeedOptions, feedWhere, hydratePosts, POST_COLUMNS } from './feed.service.js';
 
 const WINDOW_DAYS = 21;          // look this far back for candidates…
@@ -170,16 +172,36 @@ export async function rankedFeed(opts: FeedOptions) {
   return { posts: await hydratePosts(rows, viewer), cursor, hasMore: !!cursor };
 }
 
-/** The viewer saw these posts in their feed (counted again only after 30 minutes). */
+/**
+ * The viewer saw these posts (counted again for ranking only after 30 minutes).
+ * A person's FIRST view of a post also bumps its public views_count — never the author's own view
+ * (anonymous authors are recognised with the HMAC check, nothing is stored about it).
+ */
 export async function markSeen(userId: string, postIds: string[]) {
-  if (!postIds.length) return;
-  await query(
-    `INSERT INTO post_views (user_id, post_id)
-     SELECT $1, p.id FROM posts p WHERE p.id = ANY($2::uuid[])
-     ON CONFLICT (user_id, post_id) DO UPDATE SET views = post_views.views + 1, last_seen_at = now()
-       WHERE post_views.last_seen_at < now() - interval '30 minutes'`,
-    [userId, [...new Set(postIds)].slice(0, 50)],
+  const ids = [...new Set(postIds)].slice(0, 50);
+  if (!ids.length) return;
+  const ownAnon = [...(await identityService.ownedBy(ids, userId))];
+  const { rows } = await query<{ id: string; views_count: number; community_id: string | null }>(
+    `WITH ins AS (
+       INSERT INTO post_views (user_id, post_id)
+       SELECT $1, p.id FROM posts p WHERE p.id = ANY($2::uuid[]) AND p.deleted_at IS NULL
+       ON CONFLICT (user_id, post_id) DO UPDATE SET views = post_views.views + 1, last_seen_at = now()
+         WHERE post_views.last_seen_at < now() - interval '30 minutes'
+       RETURNING post_id, (xmax = 0) AS fresh
+     )
+     UPDATE posts p SET views_count = p.views_count + 1
+       FROM ins
+      WHERE ins.fresh AND p.id = ins.post_id
+        AND p.author_id IS DISTINCT FROM $1 AND NOT (p.id = ANY($3::uuid[]))
+        AND NOT p.is_pending
+      RETURNING p.id, p.views_count, p.community_id`,
+    [userId, ids, ownAnon],
   );
+  for (const r of rows) {
+    const payload = { id: r.id, viewsCount: r.views_count };
+    if (r.community_id) emit.community(r.community_id, 'post:update', payload);
+    else emit.feed('post:update', payload);
+  }
 }
 
 export async function cleanupFeedSessions() {

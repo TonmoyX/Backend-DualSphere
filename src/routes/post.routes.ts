@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type RequestHandler } from 'express';
 import { requireAuth } from '../middleware/auth.middleware.js';
 import { anonPostLimiter, commentLimiter, postCreateLimiter, reportLimiter } from '../middleware/rateLimit.middleware.js';
 import { validate } from '../middleware/validate.middleware.js';
@@ -27,9 +27,21 @@ r.delete('/:postId', requireAuth, validate({ params: v.postIdParam }), async (re
   res.json({ ok: true });
 });
 
-// Change who can share (author only)
-r.patch('/:postId', requireAuth, validate({ params: v.postIdParam, body: v.updatePostSchema }), async (req, res) => {
-  res.json(await postService.setSharePolicy(req.validated!.params.postId, req.user!, req.body.sharePolicy));
+// Author only: edit the text and/or change who can share (works for your anonymous posts too)
+// Text/tag edits share the hourly post limit (edit-spam, re-tag notification spam); share-policy toggles stay unthrottled as before
+const editLimiter: RequestHandler = (req, res, next) => (req.body?.content !== undefined || req.body?.tagIds !== undefined || req.body?.mediaIds !== undefined ? postCreateLimiter(req, res, next) : next());
+r.patch('/:postId', requireAuth, editLimiter, validate({ params: v.postIdParam, body: v.updatePostSchema }), async (req, res) => {
+  const id = req.validated!.params.postId;
+  const { content, sharePolicy, tagIds, mediaIds } = req.body as { content?: string; sharePolicy?: 'everyone' | 'friends' | 'none'; tagIds?: string[]; mediaIds?: string[] };
+  const out: Record<string, unknown> = {};
+  if (content !== undefined || tagIds !== undefined || mediaIds !== undefined) out.post = await postService.edit(id, req.user!, { content, tagIds, mediaIds });
+  if (sharePolicy !== undefined) Object.assign(out, await postService.setSharePolicy(id, req.user!, sharePolicy));
+  res.json(out);
+});
+
+// A tagged person removes themselves from a post
+r.delete('/:postId/tags/me', requireAuth, validate({ params: v.postIdParam }), async (req, res) => {
+  res.json(await postService.untagSelf(req.validated!.params.postId, req.user!));
 });
 
 r.post('/:postId/share', requireAuth, postCreateLimiter, validate({ params: v.postIdParam, body: v.sharePostSchema }), async (req, res) => {

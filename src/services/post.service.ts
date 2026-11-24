@@ -32,6 +32,29 @@ interface CreatePostInput {
   communityId?: string;
   access?: 'public' | 'subscribers' | 'paid';
   priceMinor?: number;
+  tagIds?: string[];
+}
+
+/**
+ * Who may be tagged: only the author's friends (not banned, not themselves), deduped.
+ * Tags only exist on identity posts outside communities — from an anonymous post they'd point at the hidden author.
+ */
+async function resolveTags(tagIds: string[] | undefined, mode: Visibility, communityId: string | null | undefined, user: AuthUser) {
+  const ids = [...new Set(tagIds ?? [])].filter((id) => id !== user.id);
+  if (!ids.length) return [];
+  if (mode !== 'identity') throw badRequest('ANON_NO_TAGS', 'Anonymous posts can\'t tag people — it would reveal who you are');
+  if (communityId) throw badRequest('COMMUNITY_NO_TAGS', 'You can\'t tag people in community posts');
+  const { rows } = await query<{ friend_id: string }>(
+    `SELECT e.friend_id FROM friend_edges e JOIN users u ON u.id = e.friend_id
+      WHERE e.user_id = $1 AND e.friend_id = ANY($2::uuid[]) AND u.is_banned = false`,
+    [user.id, ids],
+  );
+  if (rows.length !== ids.length) throw badRequest('BAD_TAGS', 'You can only tag your friends');
+  return ids;
+}
+
+async function notifyTagged(userIds: string[], actorId: string, postId: string) {
+  for (const id of userIds) await notificationService.create({ userId: id, type: 'tag', actorId, postId });
 }
 
 function assertPolicy(mode: Visibility, policy: SharePolicy) {
@@ -68,8 +91,9 @@ function assertCanPost(user: AuthUser, mode: Visibility) {
 }
 
 export const postService = {
-  async create({ content: raw, mediaIds, mode, user, sharePolicy = 'everyone', communityId, access = 'public', priceMinor }: CreatePostInput) {
+  async create({ content: raw, mediaIds, mode, user, sharePolicy = 'everyone', communityId, access = 'public', priceMinor, tagIds }: CreatePostInput) {
     assertCanPost(user, mode);
+    const tags = await resolveTags(tagIds, mode, communityId, user);
     assertPolicy(mode, sharePolicy);
     // Paid / subscriber-only: creators, identity posts, outside communities (money and anonymity never touch)
     if (access !== 'public') {
@@ -125,6 +149,7 @@ export const postService = {
 
       // 4. Attach media; for anon posts the media row's owner is wiped (no user↔post trail)
       await mediaService.attach(c, media.map((m) => m.id), p.id, mode === 'anonymous');
+      if (tags.length) await c.query('INSERT INTO post_tags (post_id, user_id) SELECT $1, unnest($2::uuid[])', [p.id, tags]);
       return p;
     });
 
@@ -138,6 +163,7 @@ export const postService = {
     }
     if (verdict.flags.length) emit.staff('admin:flagged', { postId: post.id, flags: verdict.flags });
     if (mode === 'anonymous') joinAnonPostRoom(user.id, post.id); // live activity alerts for the hidden author
+    await notifyTagged(tags, user.id, post.id);
     return (await hydratePosts([full], user))[0];
   },
 
@@ -207,6 +233,126 @@ export const postService = {
     await query('UPDATE posts SET share_policy = $2 WHERE id = $1', [postId, sharePolicy]);
     emit.feed('post:update', { id: postId, sharePolicy });
     return { sharePolicy };
+  },
+
+  /**
+   * Edit your own post — identity or anonymous: the text, the photos/videos (add, remove, reorder) and tags.
+   * Ownership of an anonymous post is proven with the HMAC link (isOwnerOf), and nothing here writes the author
+   * anywhere (new media loses its owner on attach, like on create), so editing never de-anonymises a post.
+   * `mediaIds` is the full final list: ids already on the post are kept, new ones must be your finished uploads.
+   */
+  async edit(postId: string, user: AuthUser, { content: raw, tagIds, mediaIds }: { content?: string; tagIds?: string[]; mediaIds?: string[] }) {
+    const row = await one(
+      `SELECT id, visibility, author_id, content, media, is_share, is_removed, is_pending, community_id, access, post_type
+         FROM posts WHERE id = $1 AND deleted_at IS NULL`,
+      [postId],
+    );
+    if (!row) throw notFound('Post');
+    if (!(await isOwnerOf(row, user))) throw forbidden('NOT_OWNER', 'You can only edit your own posts');
+    if (row.is_removed) throw forbidden('POST_REMOVED', 'Posts removed by moderators can\'t be edited');
+    const s = getSettings();
+    if (s.features.requireEmailVerification && !user.isVerified) throw forbidden('EMAIL_NOT_VERIFIED', 'Verify your email before posting');
+    if (row.visibility === 'anonymous' && !s.features.anonymousPostingEnabled) throw forbidden('ANON_DISABLED', 'Anonymous posting is currently disabled');
+
+    const content = raw === undefined ? (row.content as string) : cleanText(raw);
+    if (content.length > s.limits.maxPostLength) throw badRequest('TOO_LONG', `Posts are limited to ${s.limits.maxPostLength} characters`);
+    const textChanged = content !== row.content;
+
+    // ── Media: work out the final list, what's new and what's dropped ──
+    type Item = { id?: string; url: string; type: 'image' | 'video'; mime?: string };
+    const current: Item[] = Array.isArray(row.media) ? row.media : [];
+    let finalMedia = current;
+    let added: string[] = [];
+    let dropped: Item[] = [];
+    if (mediaIds !== undefined) {
+      const want = [...new Set(mediaIds)];
+      const curIds = current.map((m) => m.id).filter(Boolean) as string[];
+      const changed = want.length !== curIds.length || want.some((id, i) => id !== curIds[i]) || current.some((m) => !m.id);
+      if (changed) {
+        if (row.is_share) throw badRequest('IS_SHARE', 'Shared posts can\'t have photos or videos');
+        if ((row.post_type ?? 'regular') !== 'regular') throw badRequest('PROFILE_PHOTO_POST', 'Profile and cover photo posts keep their photo — you can edit the text');
+        if (want.length > s.limits.maxMediaPerPost) throw badRequest('TOO_MANY_MEDIA', `Max ${s.limits.maxMediaPerPost} attachments`);
+        added = want.filter((id) => !curIds.includes(id));
+        const fresh = await mediaService.claimable(added, user.id);
+        const byId = new Map<string, Item>([
+          ...current.filter((m) => m.id).map((m) => [m.id!, m] as const),
+          ...fresh.map((m) => [m.id as string, { id: m.id, url: m.url, type: m.kind, mime: m.mime }] as const),
+        ]);
+        finalMedia = want.map((id) => byId.get(id)!);
+        dropped = current.filter((m) => !m.id || !want.includes(m.id));
+      }
+    }
+    const mediaChanged = finalMedia !== current;
+    if (!content && finalMedia.length === 0 && !row.is_share) throw badRequest('EMPTY_POST', 'Write something or attach media');
+
+    if (textChanged || mediaChanged) {
+      const verdict = textChanged ? await abuseService.inspectPost(content, user.id, { excludePostId: postId }) : null;
+      const files = await tx(async (c) => {
+        await c.query(
+          `UPDATE posts SET content = $2, media = $3, edited_at = now(),
+                  content_hash = COALESCE($4, content_hash),
+                  abuse_flags = ARRAY(SELECT DISTINCT unnest(abuse_flags || $5::text[]))
+            WHERE id = $1`,
+          [postId, content, JSON.stringify(finalMedia), verdict?.hash ?? null, verdict?.flags ?? []],
+        );
+        // Same rule as create: anonymous posts never touch the author's row
+        if (verdict && row.visibility === 'identity' && verdict.score > 0) {
+          await c.query('UPDATE users SET abuse_score = abuse_score + $2 WHERE id = $1', [user.id, verdict.score]);
+        }
+        await mediaService.attach(c, added, postId, row.visibility === 'anonymous');
+        const gone = dropped.map((m) => m.id).filter(Boolean) as string[];
+        if (!gone.length) return [];
+        const { rows: del } = await c.query<{ object_key: string; storage: 'r2' | 'local' }>(
+          'DELETE FROM media WHERE id = ANY($1::uuid[]) AND post_id = $2 RETURNING object_key, storage',
+          [gone, postId],
+        );
+        return del;
+      });
+      // Removed photos/videos are deleted from storage too (same as deleting the post)
+      for (const f of files) await deleteObject(f.object_key, f.storage);
+      for (const m of dropped.filter((x) => !x.id)) await mediaService.releaseIfUnused(m.url);
+      if (verdict?.flags.length) emit.staff('admin:flagged', { postId, flags: verdict.flags });
+
+      // Live update for everyone else — but never leak paid content or a post still waiting for approval
+      if (!row.is_pending && (row.access ?? 'public') === 'public') {
+        const fresh = await one('SELECT edited_at FROM posts WHERE id = $1', [postId]);
+        const payload = {
+          id: postId,
+          content,
+          media: finalMedia.map((m) => ({ id: m.id, url: m.url, type: m.type, mime: m.mime })),
+          editedAt: new Date(fresh.edited_at).toISOString(),
+        };
+        if (row.community_id) emit.community(row.community_id, 'post:update', payload);
+        else emit.feed('post:update', payload);
+      }
+    }
+
+    // Tags: replace the set; only newly tagged friends get a notification
+    if (tagIds !== undefined) {
+      const tags = await resolveTags(tagIds, row.visibility, row.community_id, user);
+      const newlyTagged = await tx(async (c) => {
+        await c.query('DELETE FROM post_tags WHERE post_id = $1 AND NOT (user_id = ANY($2::uuid[]))', [postId, tags]);
+        const { rows } = await c.query<{ user_id: string }>(
+          'INSERT INTO post_tags (post_id, user_id) SELECT $1, unnest($2::uuid[]) ON CONFLICT DO NOTHING RETURNING user_id',
+          [postId, tags],
+        );
+        return rows.map((r) => r.user_id);
+      });
+      // Untagged people lose the "tagged you" notification too
+      await query(`DELETE FROM notifications WHERE post_id = $1 AND type = 'tag' AND NOT (user_id = ANY($2::uuid[]))`, [postId, tags]);
+      if (!row.is_pending) await notifyTagged(newlyTagged, user.id, postId);
+    }
+
+    const full = await one(`${POST_SELECT} WHERE p.id = $1`, [postId]);
+    return (await hydratePosts([full], user))[0];
+  },
+
+  /** A tagged person removes their own tag. */
+  async untagSelf(postId: string, user: AuthUser) {
+    const { rowCount } = await query('DELETE FROM post_tags WHERE post_id = $1 AND user_id = $2', [postId, user.id]);
+    if (!rowCount) throw notFound('Tag');
+    await query(`DELETE FROM notifications WHERE post_id = $1 AND user_id = $2 AND type = 'tag'`, [postId, user.id]);
+    return { ok: true };
   },
 
   async setSaved(postId: string, user: AuthUser, saved: boolean) {

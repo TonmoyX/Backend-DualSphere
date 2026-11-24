@@ -18,8 +18,10 @@ import { adminService } from '../services/admin.service.js';
 import { auditService } from '../services/audit.service.js';
 import { authService } from '../services/auth.service.js';
 import { identityService } from '../services/identity.service.js';
+import { suspensionService } from '../services/suspension.service.js';
+import { investigationService } from '../services/investigation.service.js';
 import { mediaService } from '../services/media.service.js';
-import { moderationService } from '../services/moderation.service.js';
+import { adminPurge, moderationService } from '../services/moderation.service.js';
 import { getSettings, updateSettings } from '../services/settings.service.js';
 import * as v from '../validators/index.js';
 
@@ -39,6 +41,15 @@ moderationRoutes.patch('/reports/:id', requirePermission('reports.resolve'), val
   }
   await moderationService.updateReport(req.validated!.params.id, req.user!, req.body);
   res.json({ ok: true });
+});
+// ── Admin: "Delete permanently" (erased from the database, audit-logged, can't be undone) ──
+moderationRoutes.delete('/posts/:id/purge', requireRole('admin'), validate({ params: v.idParam }), async (req, res) => res.json(await adminPurge.post(req.validated!.params.id, req.user!)));
+moderationRoutes.delete('/comments/:id/purge', requireRole('admin'), validate({ params: v.idParam }), async (req, res) => res.json(await adminPurge.comment(req.validated!.params.id, req.user!)));
+moderationRoutes.delete('/appeals/:id', requireRole('admin'), validate({ params: v.idParam }), async (req, res) => res.json(await adminPurge.appeal(req.validated!.params.id, req.user!)));
+
+// Admin: permanently delete a report (+ all reports on the same item); ?content=true also deletes the item itself
+moderationRoutes.delete('/reports/:id', requireRole('admin'), validate({ params: v.idParam, query: z.object({ content: z.enum(['true', 'false']).default('false') }) }), async (req, res) => {
+  res.json(await moderationService.deleteReport(req.validated!.params.id, req.user!, req.validated!.query.content === 'true'));
 });
 moderationRoutes.delete('/posts/:id', requirePermission('posts.moderate'), validate({ params: v.idParam, body: v.removeSchema }), async (req, res) => {
   await moderationService.removePost(req.validated!.params.id, req.user!, req.body.reason);
@@ -64,6 +75,23 @@ moderationRoutes.post('/users/:id/unban', requirePermission('users.ban'), valida
   await moderationService.unbanUser(req.validated!.params.id, req.user!);
   res.json({ ok: true });
 });
+
+// Review requests from suspended accounts
+moderationRoutes.get('/appeals', requirePermission('users.ban'), validate({ query: v.adminListQuery }), async (req, res) => {
+  const { status, page, limit } = req.validated!.query;
+  res.json(await suspensionService.list(status, page, limit));
+});
+moderationRoutes.get('/appeals/count', requirePermission('users.ban'), async (_req, res) => {
+  res.json(await suspensionService.list('pending', 1, 1).then((r) => ({ pending: r.total })));
+});
+moderationRoutes.post(
+  '/appeals/:id',
+  requirePermission('users.ban'),
+  validate({ params: v.idParam, body: z.object({ decision: z.enum(['approve', 'reject']), response: z.string().trim().max(1000).optional() }) }),
+  async (req, res) => {
+    res.json(await suspensionService.decide(req.validated!.params.id, req.user!, req.body.decision, req.body.response));
+  },
+);
 
 // ═══ /admin ═══
 export const adminRoutes = Router();
@@ -123,6 +151,42 @@ const identityHandler = async (req: any, res: any) => {
   res.json(await identityService.lookupPostAuthor(req.validated.params.postId, req.user, input.reason, hashIp(req.ip)));
 };
 adminRoutes.post('/identity/:postId', requireRole('admin'), validate({ params: v.postIdParam }), identityHandler);
+
+// ── Investigations (admin only): one case = one user, 2FA + reason, 30 minutes, every view audit-logged ──
+adminRoutes.post(
+  '/investigations',
+  requireRole('admin'),
+  validate({ body: z.object({ targetUserId: v.uuid, reason: z.string().trim().min(10, 'Provide a detailed reason (min 10 chars)').max(500), mfaCode: z.string().regex(/^\d{6}$/).optional() }) }),
+  async (req: any, res) => {
+    if (getSettings().moderation.requireMfaForIdentityLookup) {
+      if (!req.user.mfaEnabled) throw forbidden('MFA_REQUIRED', 'Enable two-factor authentication to open investigations');
+      if (!(await authService.verifyUserTotp(req.user.id, req.body.mfaCode))) throw forbidden('INVALID_MFA', 'A valid 6-digit authenticator code is required');
+    }
+    res.set('Cache-Control', 'no-store');
+    res.status(201).json({ case: await investigationService.open(req.user, req.body.targetUserId, req.body.reason, hashIp(req.ip)) });
+  },
+);
+adminRoutes.get('/investigations', requireRole('admin'), validate({ query: v.adminListQuery }), async (req, res) => {
+  res.json(await investigationService.list(req.validated!.query.page, req.validated!.query.limit));
+});
+adminRoutes.get('/investigations/:id', requireRole('admin'), validate({ params: v.idParam }), async (req, res) => {
+  res.json({ case: await investigationService.get(req.validated!.params.id, req.user!) });
+});
+adminRoutes.post('/investigations/:id/close', requireRole('admin'), validate({ params: v.idParam }), async (req, res) => {
+  res.json(await investigationService.close(req.validated!.params.id, req.user!));
+});
+adminRoutes.get('/investigations/:id/conversations', requireRole('admin'), validate({ params: v.idParam }), async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ conversations: await investigationService.conversations(req.validated!.params.id, req.user!) });
+});
+adminRoutes.get('/investigations/:id/conversations/:cid', requireRole('admin'), validate({ params: v.idParam.extend({ cid: v.uuid }) }), async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json(await investigationService.messages(req.validated!.params.id, req.user!, req.validated!.params.cid));
+});
+adminRoutes.get('/investigations/:id/anonymous-posts', requireRole('admin'), validate({ params: v.idParam }), async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ posts: await investigationService.anonymousPosts(req.validated!.params.id, req.user!) });
+});
 adminRoutes.get('/identity/:postId', requireRole('admin'), validate({ params: v.postIdParam }), identityHandler);
 
 adminRoutes.get('/audit-logs', requirePermission('audit.view'), validate({ query: v.auditQuery }), async (req, res) => {
@@ -176,6 +240,8 @@ adminRoutes.get('/ads/reports', requirePermission('ads.review'), validate({ quer
 adminRoutes.post('/ads/reports/:id', requirePermission('ads.review'), validate({ params: v.idParam, body: z.object({ action: z.enum(['dismiss', 'takedown']), reason: z.string().trim().max(300).optional() }) }), async (req, res) => {
   res.json(await adsManager.resolveReports(req.user!, req.validated!.params.id, req.body.action, req.body.reason));
 });
+adminRoutes.delete('/ads/reports/:id', requireRole('admin'), validate({ params: v.idParam }), async (req, res) => res.json(await adminPurge.adReports(req.validated!.params.id, req.user!)));
+adminRoutes.delete('/communities/:id/purge', requireRole('admin'), validate({ params: v.idParam }), async (req, res) => res.json(await adminPurge.community(req.validated!.params.id, req.user!)));
 adminRoutes.get('/advertisers', requirePermission('ads.manage'), validate({ query: z.object({ status: z.string().max(20).optional(), q: z.string().trim().max(60).optional() }) }), async (req, res) => {
   res.json(await businessService.staffList(req.validated!.query.status, req.validated!.query.q || undefined));
 });

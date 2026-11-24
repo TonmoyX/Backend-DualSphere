@@ -27,6 +27,12 @@ export interface PublicPost {
   sharePolicy: 'everyone' | 'friends' | 'none';
   sharesCount: number;
   isShare: boolean;
+  /** Set when the author changed the text after posting. */
+  editedAt: string | null;
+  /** Distinct people (not the author) who saw the post. */
+  viewsCount: number;
+  /** Friends tagged in the post (identity posts only; filled in by hydratePosts). */
+  tags: { id: string; username: string; displayName: string }[];
 }
 
 export function publicPost(row: any, opts: { liked?: boolean; owner?: boolean } = {}): PublicPost {
@@ -56,6 +62,9 @@ export function publicPost(row: any, opts: { liked?: boolean; owner?: boolean } 
     sharePolicy: (row.share_policy ?? 'everyone') as 'everyone' | 'friends' | 'none',
     sharesCount: row.shares_count ?? 0,
     isShare: !!row.is_share,
+    editedAt: row.edited_at ? new Date(row.edited_at).toISOString() : null,
+    tags: [],
+    viewsCount: row.views_count ?? 0,
   };
 }
 

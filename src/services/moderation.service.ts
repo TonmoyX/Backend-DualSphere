@@ -5,6 +5,8 @@ import { ROLE_RANK, type AuthUser, type Role } from '../types/index.js';
 import { auditService } from './audit.service.js';
 import { notificationService } from './notification.service.js';
 import { messageService } from './message.service.js';
+import { deleteObject } from '../lib/storage.js';
+import { mediaService } from './media.service.js';
 
 export const moderationService = {
   async listReports(status: string | undefined, page: number, limit: number) {
@@ -189,16 +191,180 @@ export const moderationService = {
     const until = durationHours ? new Date(Date.now() + durationHours * 3_600_000) : null;
     await tx(async (c) => {
       await c.query('UPDATE users SET is_banned = true, ban_reason = $2, banned_until = $3 WHERE id = $1', [userId, reason, until]);
-      await c.query('UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [userId]);
+      // Sessions stay alive but are limited to the suspension page (auth middleware answers BANNED everywhere else)
       await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'USER_BAN', targetId: userId, targetType: 'user', metadata: { reason, until } }, c);
     });
     emit.revoke(userId, { reason: 'banned' });
+  },
+
+  /**
+   * Admin: permanently delete a report (and every other report on the same item). With `withContent`, the reported
+   * post / comment / message is permanently deleted from the database too, with its files. Audit-logged.
+   * Profiles are never deleted here (ban the account instead).
+   */
+  async deleteReport(reportId: string, actor: AuthUser, withContent: boolean) {
+    const r = await one<{ id: string; target_type: string; target_id: string }>('SELECT id, target_type, target_id FROM reports WHERE id = $1', [reportId]);
+    if (!r) throw notFound('Report');
+    if (withContent && r.target_type === 'user') throw badRequest('CANT_DELETE_USER', 'Profiles can\'t be deleted here — ban the account instead');
+
+    let deleted: 'none' | 'post' | 'comment' | 'message' = 'none';
+    if (withContent && r.target_type === 'post') deleted = (await purgePost(r.target_id)) ? 'post' : 'none';
+    else if (withContent && r.target_type === 'comment') deleted = (await purgeComment(r.target_id)) ? 'comment' : 'none';
+    else if (withContent && r.target_type === 'message') deleted = (await purgeMessage(r.target_id)) ? 'message' : 'none';
+
+    const { rowCount } = await query('DELETE FROM reports WHERE target_type = $1 AND target_id = $2', [r.target_type, r.target_id]);
+    await auditService.log({
+      actorId: actor.id, actorRole: actor.role, action: withContent ? 'REPORT_DELETE_WITH_CONTENT' : 'REPORT_DELETE',
+      targetId: r.target_id, targetType: r.target_type, metadata: { reportId, reportsDeleted: rowCount, contentDeleted: deleted },
+    });
+    emit.staff('admin:report-deleted', { targetType: r.target_type, targetId: r.target_id });
+    return { reportsDeleted: rowCount ?? 0, contentDeleted: deleted };
   },
 
   async unbanUser(userId: string, actor: AuthUser) {
     await this.assertOutranks(actor, userId); // a moderator can't lift a ban on another staff account
     const r = await query('UPDATE users SET is_banned = false, ban_reason = NULL, banned_until = NULL WHERE id = $1 RETURNING id', [userId]);
     if (!r.rowCount) throw notFound('User');
+    // Lifting the ban answers any open review request
+    await query(
+      `UPDATE ban_appeals SET status = 'approved', reviewed_by = $2, reviewed_at = now(), response = COALESCE(response, 'Your account has been restored.')
+        WHERE user_id = $1 AND status = 'pending'`,
+      [userId, actor.id],
+    );
     await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'USER_UNBAN', targetId: userId, targetType: 'user' });
+  },
+};
+
+// ── permanent deletes used by deleteReport (admin) ──
+
+async function purgePost(postId: string) {
+  const row = await one('SELECT id, visibility, author_id, is_share, shared_post_id, media, community_id, is_pending FROM posts WHERE id = $1', [postId]);
+  if (!row) return false;
+  const files = await tx(async (c) => {
+    const { rows: media } = await c.query<{ id: string; object_key: string; storage: 'r2' | 'local' }>('SELECT id, object_key, storage FROM media WHERE post_id = $1', [postId]);
+    await c.query(`DELETE FROM reports WHERE target_type = 'comment' AND target_id IN (SELECT id FROM comments WHERE post_id = $1)`, [postId]);
+    await c.query('DELETE FROM posts WHERE id = $1', [postId]); // comments, likes, tags, anonymous link, notifications cascade
+    await c.query('DELETE FROM media WHERE id = ANY($1::uuid[])', [media.map((m) => m.id)]);
+    if (row.community_id) {
+      if (!row.is_pending) await c.query('UPDATE communities SET post_count = GREATEST(post_count - 1, 0) WHERE id = $1', [row.community_id]);
+    } else if (row.visibility === 'identity' && row.author_id) {
+      await c.query('UPDATE users SET post_count = GREATEST(post_count - 1, 0) WHERE id = $1', [row.author_id]);
+    }
+    if (row.is_share && row.shared_post_id) {
+      const { rows } = await c.query('UPDATE posts SET shares_count = GREATEST(shares_count - 1, 0) WHERE id = $1 RETURNING shares_count', [row.shared_post_id]);
+      if (rows[0]) emit.feed('post:update', { id: row.shared_post_id, sharesCount: rows[0].shares_count });
+    }
+    return media;
+  });
+  for (const f of files) await deleteObject(f.object_key, f.storage).catch(() => {});
+  for (const m of (row.media ?? []) as { url: string }[]) await mediaService.releaseIfUnused(m.url);
+  if (row.community_id) emit.community(row.community_id, 'post:removed', { id: postId });
+  else emit.feed('post:removed', { id: postId });
+  return true;
+}
+
+async function purgeComment(commentId: string) {
+  const c0 = await one('SELECT id, post_id FROM comments WHERE id = $1', [commentId]);
+  if (!c0) return false;
+  const ids = await tx(async (cl) => {
+    const { rows: tree } = await cl.query<{ id: string; is_removed: boolean }>(
+      `WITH RECURSIVE t AS (SELECT id, is_removed FROM comments WHERE id = $1
+         UNION ALL SELECT c.id, c.is_removed FROM comments c JOIN t ON c.parent_id = t.id) SELECT id, is_removed FROM t`,
+      [commentId],
+    );
+    const all = tree.map((r) => r.id);
+    await cl.query(`DELETE FROM reports WHERE target_type = 'comment' AND target_id = ANY($1::uuid[]) AND target_id <> $2`, [all, commentId]);
+    await cl.query('DELETE FROM comments WHERE id = $1', [commentId]); // replies, likes, notifications cascade
+    const { rows } = await cl.query('UPDATE posts SET comments_count = GREATEST(comments_count - $2, 0) WHERE id = $1 RETURNING comments_count', [c0.post_id, tree.filter((r) => !r.is_removed).length]);
+    if (rows[0]) emit.feed('post:update', { id: c0.post_id, commentsCount: rows[0].comments_count });
+    return all;
+  });
+  emit.post(c0.post_id, 'comment:deleted', { id: commentId, ids });
+  return true;
+}
+
+/** Permanent: an admin's deletion skips the 90-day message archive on purpose. */
+async function purgeMessage(messageId: string) {
+  const m = await one('SELECT id, conversation_id FROM messages WHERE id = $1', [messageId]);
+  if (!m) return false;
+  const files = await tx(async (c) => {
+    const { rows } = await c.query<{ id: string; object_key: string; storage: 'r2' | 'local' }>(
+      `SELECT md.id, md.object_key, md.storage FROM media md WHERE md.message_id = $1
+          AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.id <> $1 AND x.media @> jsonb_build_array(jsonb_build_object('id', md.id::text)))`,
+      [messageId],
+    );
+    await c.query('DELETE FROM messages WHERE id = $1', [messageId]); // reactions, edit history, hidden markers cascade
+    await c.query('DELETE FROM media WHERE id = ANY($1::uuid[])', [rows.map((r) => r.id)]);
+    return rows;
+  });
+  for (const f of files) await deleteObject(f.object_key, f.storage).catch(() => {});
+  const { rows: people } = await query<{ user_id: string }>('SELECT user_id FROM conversation_participants WHERE conversation_id = $1', [m.conversation_id]);
+  emit.users(people.map((p) => p.user_id), 'dm:deleted', { conversationId: m.conversation_id, messageId });
+  return true;
+}
+
+/**
+ * Admin "Delete permanently" actions across the control panel. Everything here is erased from the database
+ * (and files from storage) and can't be undone; each one writes an audit entry. The audit log itself and
+ * investigation case history are deliberately NOT deletable (they're the tamper-evident safeguard).
+ */
+export const adminPurge = {
+  async post(postId: string, actor: AuthUser) {
+    const row = await one<{ id: string; visibility: string; content: string }>('SELECT id, visibility, left(content, 120) AS content FROM posts WHERE id = $1', [postId]);
+    if (!row) throw notFound('Post');
+    await query(`DELETE FROM reports WHERE target_type = 'post' AND target_id = $1`, [postId]);
+    await purgePost(postId);
+    await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'POST_PURGE', targetId: postId, targetType: 'post', metadata: { visibility: row.visibility, excerpt: row.content } });
+    return { ok: true };
+  },
+
+  async comment(commentId: string, actor: AuthUser) {
+    const row = await one<{ id: string; post_id: string; content: string }>('SELECT id, post_id, left(content, 120) AS content FROM comments WHERE id = $1', [commentId]);
+    if (!row) throw notFound('Comment');
+    await query(`DELETE FROM reports WHERE target_type = 'comment' AND target_id = $1`, [commentId]);
+    await purgeComment(commentId);
+    await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'COMMENT_PURGE', targetId: commentId, targetType: 'comment', metadata: { postId: row.post_id, excerpt: row.content } });
+    return { ok: true };
+  },
+
+  async feedback(id: string, actor: AuthUser) {
+    const { rowCount } = await query('DELETE FROM feedback WHERE id = $1', [id]);
+    if (!rowCount) throw notFound('Feedback');
+    await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'FEEDBACK_DELETE', targetId: id, targetType: 'feedback' });
+    return { ok: true };
+  },
+
+  async appeal(id: string, actor: AuthUser) {
+    const a = await one<{ user_id: string }>('DELETE FROM ban_appeals WHERE id = $1 RETURNING user_id', [id]);
+    if (!a) throw notFound('Appeal');
+    await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'APPEAL_DELETE', targetId: a.user_id, targetType: 'user', metadata: { appealId: id } });
+    return { ok: true };
+  },
+
+  /** All reports about one ad (the ad itself is deleted from "Live ads"). */
+  async adReports(creativeId: string, actor: AuthUser) {
+    const { rowCount } = await query('DELETE FROM ad_reports WHERE creative_id = $1', [creativeId]);
+    if (!rowCount) throw notFound('Ad reports');
+    await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'AD_REPORTS_DELETE', targetId: creativeId, targetType: 'ad_creative', metadata: { count: rowCount } });
+    return { ok: true, deleted: rowCount };
+  },
+
+  /** A community that's already deleted (soft), with every post in it and their files. */
+  async community(id: string, actor: AuthUser) {
+    const c = await one<{ id: string; slug: string; deleted_at: Date | null; icon_url: string | null; banner_url: string | null }>(
+      'SELECT id, slug, deleted_at, icon_url, banner_url FROM communities WHERE id = $1', [id],
+    );
+    if (!c) throw notFound('Community');
+    if (!c.deleted_at) throw badRequest('NOT_DELETED', 'Delete the community first, then delete it permanently');
+    const { rows: posts } = await query<{ id: string }>('SELECT id FROM posts WHERE community_id = $1', [id]);
+    for (const p of posts) {
+      await query(`DELETE FROM reports WHERE target_type = 'post' AND target_id = $1`, [p.id]);
+      await purgePost(p.id);
+    }
+    await query('DELETE FROM communities WHERE id = $1', [id]); // members, bans, invites cascade
+    await mediaService.releaseIfUnused(c.icon_url);
+    await mediaService.releaseIfUnused(c.banner_url);
+    await auditService.log({ actorId: actor.id, actorRole: actor.role, action: 'COMMUNITY_PURGE', targetId: id, targetType: 'community', metadata: { slug: c.slug, posts: posts.length } });
+    return { ok: true, postsDeleted: posts.length };
   },
 };

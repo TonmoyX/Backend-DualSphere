@@ -36,7 +36,9 @@ export interface AbuseVerdict {
 
 export const abuseService = {
   /** Runs before a post is stored. Throws on exact duplicates; returns flags for everything else. */
-  async inspectPost(content: string, userId: string): Promise<AbuseVerdict> {
+  async inspectPost(content: string, userId: string, opts: { excludePostId?: string } = {}): Promise<AbuseVerdict> {
+    // Editing: the post being edited must not count as a duplicate of itself
+    const self = opts.excludePostId ?? null;
     const s = getSettings();
     const hash = contentHash(content);
     const flags: string[] = [];
@@ -44,8 +46,9 @@ export const abuseService = {
 
     if (content.length > 0 && s.moderation.duplicateWindowMinutes > 0) {
       const dup = await query(
-        `SELECT 1 FROM posts WHERE content_hash = $1 AND created_at > now() - ($2 || ' minutes')::interval LIMIT 1`,
-        [hash, String(s.moderation.duplicateWindowMinutes)],
+        `SELECT 1 FROM posts WHERE content_hash = $1 AND created_at > now() - ($2 || ' minutes')::interval
+            AND ($3::uuid IS NULL OR id <> $3::uuid) LIMIT 1`,
+        [hash, String(s.moderation.duplicateWindowMinutes), self],
       );
       if (dup.rowCount) throw conflict('DUPLICATE_CONTENT', 'This exact content was posted recently');
 
@@ -53,7 +56,9 @@ export const abuseService = {
       if (content.length >= 20) {
         const { rows } = await query<{ content: string }>(
           `SELECT content FROM posts WHERE created_at > now() - interval '1 hour' AND char_length(content) >= 20
+              AND ($1::uuid IS NULL OR id <> $1::uuid)
             ORDER BY created_at DESC LIMIT 50`,
+          [self],
         );
         if (rows.some((r) => similarity(r.content, content) >= s.moderation.similarityThreshold)) {
           flags.push('duplicate:similar');

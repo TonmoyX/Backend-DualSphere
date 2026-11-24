@@ -51,6 +51,33 @@ export const identityService = {
   },
 
   /**
+   * Every anonymous post this user wrote. Anonymous posts carry no author, so this scans them in batches and keeps
+   * the ones whose HMAC proves ownership. Used for the user's own data download and for admin investigations
+   * (which are audit-logged by the caller).
+   */
+  async anonymousPostsOf(userId: string, columns: string, maxScan = 100_000): Promise<any[]> {
+    const out: any[] = [];
+    const BATCH = 1000;
+    let cursor: { ts: Date; id: string } | null = null;
+    for (let scanned = 0; scanned < maxScan; scanned += BATCH) {
+      const params: unknown[] = [BATCH];
+      if (cursor) params.push(cursor.ts, cursor.id);
+      const rows = ((await query(
+        `SELECT ${columns}, created_at AS _ts, id AS _id FROM posts WHERE visibility = 'anonymous' AND deleted_at IS NULL
+           ${cursor ? 'AND (created_at, id) < ($2, $3)' : ''} ORDER BY created_at DESC, id DESC LIMIT $1`,
+        params,
+      )) as { rows: any[] }).rows;
+      if (!rows.length) break;
+      const mine: Set<string> = await identityService.ownedBy(rows.map((r: any) => r._id as string), userId);
+      out.push(...rows.filter((r: any) => mine.has(r._id)));
+      const last: any = rows[rows.length - 1];
+      cursor = { ts: last._ts, id: last._id };
+      if (rows.length < BATCH) break;
+    }
+    return out;
+  },
+
+  /**
    * De-anonymisation. Admin only, MFA-gated, reason required.
    * The audit entry is written BEFORE the lookup, so even a failed/aborted lookup is recorded.
    */

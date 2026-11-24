@@ -5,6 +5,8 @@ import { verifyAccessToken } from '../lib/jwt.js';
 import { AppError, unauthorized } from '../lib/errors.js';
 import type { Role } from '../types/index.js';
 
+export interface SuspendedUser { id: string; sessionId: string; username: string; reason: string | null; until: Date | null }
+
 type AuthError = { kind: 'expired' } | { kind: 'invalid' } | { kind: 'banned'; reason: string | null; until: Date | null };
 
 declare global {
@@ -12,6 +14,8 @@ declare global {
   namespace Express {
     interface Request {
       authError?: AuthError;
+      /** Signed in, but the account is suspended: only the suspension page's endpoints accept this. */
+      suspended?: SuspendedUser;
     }
   }
 }
@@ -60,6 +64,7 @@ export async function attachUser(req: Request, res: Response, next: NextFunction
       await query('UPDATE users SET is_banned = false, ban_reason = NULL, banned_until = NULL WHERE id = $1', [row.id]);
     } else {
       req.authError = { kind: 'banned', reason: row.ban_reason, until: row.banned_until };
+      req.suspended = { id: row.id, sessionId: v.claims.sid, username: row.username, reason: row.ban_reason, until: row.banned_until };
       return next();
     }
   }
@@ -75,6 +80,14 @@ export async function attachUser(req: Request, res: Response, next: NextFunction
     permissions: effectivePermissions(row.role, row.permissions), // read fresh every request → changes apply instantly
   };
   next();
+}
+
+/** Suspension page only: a live session whose account is banned. Everything else still answers BANNED. */
+export function requireSuspended(req: Request, _res: Response, next: NextFunction) {
+  if (req.suspended) return next();
+  if (req.user) throw new AppError(409, 'NOT_SUSPENDED', 'This account is not suspended');
+  if (req.authError?.kind === 'expired') throw unauthorized('TOKEN_EXPIRED', 'Access token expired');
+  throw unauthorized();
 }
 
 export function requireAuth(req: Request, _res: Response, next: NextFunction) {

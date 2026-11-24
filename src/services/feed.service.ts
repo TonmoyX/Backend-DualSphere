@@ -104,6 +104,23 @@ export async function hydratePosts(rows: any[], viewer?: AuthUser): Promise<Hydr
     return { ...post, ...base, content: text.length > 100 ? `${text.slice(0, 100).trimEnd()}…` : text, media: [], locked: true, lockedMediaCount: post.media.length };
   };
 
+  // Tagged friends (identity posts only — anonymous posts can never carry tags)
+  const tagged = all0.filter((r) => r.visibility === 'identity').map((r) => r.id as string);
+  const tagsByPost = new Map<string, PublicPost['tags']>();
+  if (tagged.length) {
+    const { rows: t } = await query<{ post_id: string; id: string; username: string; display_name: string }>(
+      `SELECT t.post_id, u.id, u.username, u.display_name FROM post_tags t JOIN users u ON u.id = t.user_id
+        WHERE t.post_id = ANY($1::uuid[]) AND u.is_banned = false ORDER BY t.created_at, u.display_name`,
+      [tagged],
+    );
+    for (const r of t) {
+      const list = tagsByPost.get(r.post_id) ?? [];
+      list.push({ id: r.id, username: r.username, displayName: r.display_name });
+      tagsByPost.set(r.post_id, list);
+    }
+  }
+  const withTags = <T extends PublicPost>(p: T): T => ({ ...p, tags: tagsByPost.get(p.id) ?? [] });
+
   let saved = new Set<string>();
   let liked = new Set<string>();
   let friends = new Set<string>();
@@ -134,12 +151,12 @@ export async function hydratePosts(rows: any[], viewer?: AuthUser): Promise<Hydr
     const target = r.is_share ? original : r;
     const owner = isOwner(r);
     return {
-      ...gate(publicPost(r, { owner, liked: r.liked ?? liked.has(r.id) }), r),
+      ...gate(withTags(publicPost(r, { owner, liked: r.liked ?? liked.has(r.id) })), r),
       savedByMe: saved.has(r.id),
       // Pending posts and posts in private / invite-only communities can't be shared
       canShare: target && !r.is_pending && (target.access ?? 'public') === 'public' && !(r.community_id && nonPublic.has(r.community_id))
         ? shareAllowed(target, viewer, isOwner(target), friends) : false,
-      sharedPost: original ? gate(publicPost(original, { owner: isOwner(original) }), original) : null,
+      sharedPost: original ? gate(withTags(publicPost(original, { owner: isOwner(original) })), original) : null,
       community: r.community_id ? (communityById.get(r.community_id) ?? null) : null,
       isPinned: !!r.pinned_at,
       isPending: !!r.is_pending,

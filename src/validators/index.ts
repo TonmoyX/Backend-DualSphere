@@ -62,14 +62,21 @@ export const createPostSchema = z.object({
   communityId: uuid.optional(), // post into a community (membership + anon policy checked server-side)
   access: z.enum(['public', 'subscribers', 'paid']).default('public'), // creators only, identity posts only
   priceMinor: z.number().int().positive().max(100_000_000).optional(),
+  tagIds: z.array(uuid).max(20).default([]), // friends tagged in the post (identity posts only)
 });
 export const sharePostSchema = z.object({
   content: z.string().max(5000).default(''),
   mode: z.enum(['identity', 'anonymous']).default('identity'),
 });
-export const updatePostSchema = z.object({
-  sharePolicy: z.enum(['everyone', 'friends', 'none']),
-});
+// Author-only changes: who can share, and/or the post text (identity and anonymous posts alike)
+export const updatePostSchema = z
+  .object({
+    sharePolicy: z.enum(['everyone', 'friends', 'none']).optional(),
+    content: z.string().max(5000).optional(),
+    tagIds: z.array(uuid).max(20).optional(), // replaces the tagged friends
+    mediaIds: z.array(uuid).max(10).optional(), // the full final list: keep / add / remove / reorder photos & videos
+  })
+  .refine((b) => b.sharePolicy !== undefined || b.content !== undefined || b.tagIds !== undefined || b.mediaIds !== undefined, { message: 'Nothing to update' });
 export const createPostWithModeSchema = createPostSchema.extend({
   mode: z.enum(['identity', 'anonymous']).default('identity'),
 });

@@ -150,11 +150,10 @@ export const authService = {
       if (user) await auditService.log({ actorId: user.id, action: 'LOGIN_FAILED', targetId: user.id, targetType: 'user', metadata: { ipHash: hashIp(req.ip) } });
       throw unauthorized('INVALID_CREDENTIALS', 'Incorrect email/username or password');
     }
-    if (user.is_banned && !(user.banned_until && new Date(user.banned_until).getTime() < Date.now())) {
-      throw new AppError(403, 'BANNED', 'This account is suspended', { reason: user.ban_reason, until: user.banned_until });
-    }
+    // Suspended accounts still sign in (password + 2FA as usual), but the session only opens the suspension page:
+    // see the reason, request a review, download their posts, log out. Every other endpoint answers BANNED.
     if (user.mfa_enabled) return { mfaRequired: true as const, challenge: signMfaChallenge(user.id) };
-    return { mfaRequired: false as const, user: await this.completeLogin(req, res, user) };
+    return this.loginResult(await this.completeLogin(req, res, user));
   },
 
   async loginMfa(req: Request, res: Response, challenge: string, code: string) {
@@ -169,8 +168,17 @@ export const authService = {
     return this.completeLogin(req, res, user);
   },
 
+  loginResult(u: Awaited<ReturnType<typeof getSelf>> | null) {
+    return u ? { mfaRequired: false as const, user: u } : { mfaRequired: false as const, user: null, suspended: true as const };
+  },
+
+  /** Returns null for a suspended account (its session is limited to the suspension page). */
   async completeLogin(req: Request, res: Response, user: any) {
     await createSession(req, res, user);
+    if (user.is_banned && !(user.banned_until && new Date(user.banned_until).getTime() < Date.now())) {
+      await auditService.log({ actorId: user.id, actorRole: user.role, action: 'USER_LOGIN_SUSPENDED', targetId: user.id, targetType: 'user', metadata: { ipHash: hashIp(req.ip) } });
+      return null;
+    }
     await query('UPDATE users SET last_login_at = now() WHERE id = $1', [user.id]);
     await checkDevice(req, user).catch((err) => logger.error({ err }, 'device check failed'));
     await auditService.log({ actorId: user.id, actorRole: user.role, action: 'USER_LOGIN', targetId: user.id, targetType: 'user', metadata: { ipHash: hashIp(req.ip) } });
@@ -188,7 +196,8 @@ export const authService = {
         WHERE s.refresh_token_hash = $1 OR s.prev_token_hash = $1 LIMIT 1`,
       [hash],
     );
-    if (!s || s.revoked_at || new Date(s.expires_at).getTime() < Date.now() || s.is_banned) {
+    // Banned accounts keep a (limited) session for the suspension page, so refresh still works for them
+    if (!s || s.revoked_at || new Date(s.expires_at).getTime() < Date.now()) {
       clearAuthCookies(res);
       throw unauthorized('SESSION_INVALID', 'Session expired, please sign in again');
     }

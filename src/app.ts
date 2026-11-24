@@ -11,6 +11,7 @@ import { globalLimiter } from './middleware/rateLimit.middleware.js';
 import { honeypot, maintenanceGuard, originGuard } from './middleware/security.middleware.js';
 import { adminRoutes, moderationRoutes } from './routes/admin.routes.js';
 import authRoutes from './routes/auth.routes.js';
+import { accountRoutes } from './routes/account.routes.js';
 import { callRoutes, commentRoutes, feedRoutes, mediaRoutes, notificationRoutes, settingsRoutes, userRoutes } from './routes/misc.routes.js';
 import { storyRoutes } from './routes/story.routes.js';
 import { adminFeedbackRoutes, feedbackRoutes } from './routes/feedback.routes.js';
@@ -95,6 +96,7 @@ export function createApp() {
 
   const api = express.Router();
   api.use('/auth', authRoutes);
+  api.use('/account', accountRoutes);
   api.use('/posts', postRoutes);
   api.use('/feed', feedRoutes);
   api.use('/users', userRoutes);

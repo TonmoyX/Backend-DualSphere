@@ -7,7 +7,6 @@ import type { PoolClient } from 'pg';
 import { one, query, tx } from '../config/db.js';
 import { AppError, badRequest, forbidden, notFound } from '../lib/errors.js';
 import { emit, forgetMembership, isOnline } from '../lib/realtime.js';
-import { deleteObject } from '../lib/storage.js';
 import { cleanText } from '../lib/text.js';
 import type { AuthUser } from '../types/index.js';
 import { auditService } from './audit.service.js';
@@ -43,6 +42,29 @@ async function membership(conversationId: string, userId: string) {
   );
   if (!row) throw notFound('Conversation');
   return row;
+}
+
+/**
+ * Copy messages into the 90-day archive before they're deleted for users (see Privacy Policy).
+ * Their files are kept too and only removed when the archive entry is purged.
+ */
+async function archiveMessages(c: PoolClient, where: { messageId: string } | { conversationId: string }, reason: 'unsent' | 'conversation_deleted', deletedBy: string | null) {
+  const byMsg = 'messageId' in where;
+  await c.query(
+    `INSERT INTO message_archive (message_id, conversation_id, conversation_title, is_group, participant_ids, sender_id, kind, content, media,
+                                  reply_to_id, edit_history, files, sent_at, edited_at, reason, deleted_by)
+     SELECT m.id, m.conversation_id, cv.title, cv.is_group,
+            COALESCE((SELECT array_agg(p.user_id) FROM conversation_participants p WHERE p.conversation_id = m.conversation_id), '{}'),
+            m.sender_id, m.kind, m.content, m.media, m.reply_to_id,
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('content', e.previous_content, 'editedAt', e.edited_at) ORDER BY e.edited_at)
+                        FROM message_edits e WHERE e.message_id = m.id), '[]'::jsonb),
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('mediaId', md.id, 'objectKey', md.object_key, 'storage', md.storage))
+                        FROM media md WHERE md.message_id = m.id), '[]'::jsonb),
+            m.created_at, m.edited_at, $2, $3
+       FROM messages m JOIN conversations cv ON cv.id = m.conversation_id
+      WHERE ${byMsg ? 'm.id = $1' : 'm.conversation_id = $1'} AND m.kind <> 'system'`,
+    [byMsg ? where.messageId : where.conversationId, reason, deletedBy],
+  );
 }
 
 async function systemMessage(c: PoolClient, conversationId: string, actorId: string, text: string) {
@@ -479,6 +501,7 @@ export const messageService = {
       await c.query('DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2', [conversationId, user.id]);
       const left = await c.query(`SELECT user_id, role FROM conversation_participants WHERE conversation_id = $1 ORDER BY joined_at`, [conversationId]);
       if (left.rowCount === 0) {
+        await archiveMessages(c, { conversationId }, 'conversation_deleted', user.id);
         await c.query('DELETE FROM conversations WHERE id = $1', [conversationId]);
         return;
       }
@@ -550,7 +573,11 @@ export const messageService = {
     const text = cleanText(content);
     if (!text && !(m.media?.length > 0)) throw badRequest('EMPTY_MESSAGE', 'Message is empty');
     if (text.length > 2000) throw badRequest('TOO_LONG', 'Messages are limited to 2000 characters');
-    await query('UPDATE messages SET content = $2, edited_at = now() WHERE id = $1', [messageId, text]);
+    await tx(async (c) => {
+      // Keep the earlier version (90-day retention, admin investigations only)
+      await c.query('INSERT INTO message_edits (message_id, previous_content) SELECT id, content FROM messages WHERE id = $1 AND content <> $2', [messageId, text]);
+      await c.query('UPDATE messages SET content = $2, edited_at = now() WHERE id = $1', [messageId, text]);
+    });
     const msg = (await messageById(messageId))!;
     emit.users(await participantIds(m.conversation_id), 'dm:edit', { conversationId: m.conversation_id, message: msg });
     return msg;
@@ -645,21 +672,13 @@ export const messageService = {
     const m = await one('SELECT id, conversation_id, sender_id, kind, unsent_at FROM messages WHERE id = $1', [messageId]);
     if (!m) throw notFound('Message');
     if (m.sender_id !== userId || m.kind === 'system') throw forbidden('NOT_OWNER', 'You can only unsend your own messages');
-    // Permanently delete the message for everyone (reactions, hidden-markers cascade;
-    // replies keep working but lose the quote; a pinned reference is cleared by FK).
-    const files = await tx(async (c) => {
-      const { rows } = await c.query<{ id: string; object_key: string; storage: 'r2' | 'local' }>(
-        `SELECT md.id, md.object_key, md.storage FROM media md
-          WHERE md.message_id = $1
-            AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.id <> $1 AND x.media @> jsonb_build_array(jsonb_build_object('id', md.id::text)))`,
-        [messageId],
-      );
+    // Gone for everyone right away (reactions, hidden-markers cascade; replies lose the quote; a pinned
+    // reference is cleared by FK). A copy and its files stay in the 90-day archive for admin investigations.
+    await tx(async (c) => {
+      await archiveMessages(c, { messageId }, 'unsent', userId);
       await c.query(`DELETE FROM reports WHERE target_type = 'message' AND target_id = $1`, [messageId]);
       await c.query('DELETE FROM messages WHERE id = $1', [messageId]);
-      await c.query('DELETE FROM media WHERE id = ANY($1::uuid[])', [rows.map((r) => r.id)]);
-      return rows; // files still used by forwarded copies are kept
     });
-    for (const f of files) await deleteObject(f.object_key, f.storage);
     emit.users(await participantIds(m.conversation_id), 'dm:deleted', { conversationId: m.conversation_id, messageId });
   },
 

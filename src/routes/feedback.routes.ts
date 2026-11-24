@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { query } from '../config/db.js';
 import { emit } from '../lib/realtime.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
+import { adminPurge } from '../services/moderation.service.js';
 import { reportLimiter } from '../middleware/rateLimit.middleware.js';
 import { requirePermission, requireRole } from '../middleware/rbac.middleware.js';
 import { validate } from '../middleware/validate.middleware.js';
@@ -61,4 +62,9 @@ adminFeedbackRoutes.get('/', validate({ query: v.adminListQuery }), async (req, 
 adminFeedbackRoutes.patch('/:id', validate({ params: v.idParam, body: z.object({ status: z.enum(['new', 'resolved']) }) }), async (req, res) => {
   await query('UPDATE feedback SET status = $2 WHERE id = $1', [req.validated!.params.id, req.body.status]);
   res.json({ ok: true });
+});
+
+// Admin: delete a feedback item permanently
+adminFeedbackRoutes.delete('/:id', requireRole('admin'), validate({ params: v.idParam }), async (req, res) => {
+  res.json(await adminPurge.feedback(req.validated!.params.id, req.user!));
 });

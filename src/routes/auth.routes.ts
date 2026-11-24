@@ -17,7 +17,7 @@ r.post('/login', authLimiter, validate({ body: v.loginSchema }), async (req, res
 });
 
 r.post('/login/mfa', authLimiter, validate({ body: v.mfaLoginSchema }), async (req, res) => {
-  res.json({ mfaRequired: false, user: await authService.loginMfa(req, res, req.body.challenge, req.body.code) });
+  res.json(authService.loginResult(await authService.loginMfa(req, res, req.body.challenge, req.body.code)));
 });
 
 r.post('/refresh', async (req, res) => {

@@ -9,7 +9,7 @@ const ANON_SCAN = 1000;
 
 interface NewNotification {
   userId: string;
-  type: 'like' | 'comment' | 'reply' | 'security' | 'system' | 'moderation' | 'friend_request' | 'friend_accept' | 'share';
+  type: 'like' | 'comment' | 'reply' | 'security' | 'system' | 'moderation' | 'friend_request' | 'friend_accept' | 'share' | 'tag';
   actorId?: string | null;
   postId?: string | null;
   commentId?: string | null;
