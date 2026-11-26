@@ -147,11 +147,13 @@ export function initRealtime(server: HttpServer) {
     });
 
     if (u) registerCallHandlers(socket, u.id);
+    if (u) registerGroupCallHandlers(socket, u.id);
 
     broadcastStaffPresence();
     socket.on('disconnect', async () => {
       broadcastStaffPresence();
       if (!u) return;
+      leaveGroupCallsOnSocket(u.id, socket.id); // the tab that was in a group call closed
       const n = (connections.get(u.id) ?? 1) - 1;
       if (n > 0) return void connections.set(u.id, n);
       connections.delete(u.id);
@@ -259,7 +261,8 @@ interface Call {
 const calls = new Map<string, Call>();
 const RING_TIMEOUT_MS = 45_000;
 
-const inCall = (userId: string) => [...calls.values()].some((c) => c.callerId === userId || c.calleeId === userId);
+const inCall = (userId: string) =>
+  [...calls.values()].some((c) => c.callerId === userId || c.calleeId === userId) || inGroupCall(userId);
 const peerOf = (c: Call, userId: string) => (c.callerId === userId ? c.calleeId : c.callerId);
 const isParty = (c: Call | undefined, userId: string): c is Call => !!c && (c.callerId === userId || c.calleeId === userId);
 
@@ -341,5 +344,188 @@ function registerCallHandlers(socket: Socket, userId: string) {
     const c = calls.get(String(callId));
     if (!isParty(c, userId) || !data || JSON.stringify(data).length > 64_000) return;
     emit.user(peerOf(c, userId), 'call:signal', { callId: c.id, data });
+  });
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// Group voice/video calls — mesh WebRTC (every participant connects to every other one).
+// The server keeps who is in which call and relays SDP/ICE between two named participants.
+// Group calls are ALWAYS joined as yourself: every participant's name and photo is shown to the others
+// (even in groups where people may send anonymous messages).
+// ═══════════════════════════════════════════════════════════════
+interface GroupCall {
+  id: string;
+  conversationId: string;
+  kind: 'audio' | 'video';
+  startedBy: string;
+  participants: Map<string, string>; // userId → socket id of the tab in the call
+  everJoined: number; // people who joined (incl. the starter), for the call log
+  startedAt: number;
+  connectedAt?: number; // when a second person joined
+  ringTimer?: NodeJS.Timeout;
+}
+const groupCalls = new Map<string, GroupCall>();
+const groupCallByConversation = new Map<string, string>();
+export const MAX_GROUP_CALL = 8;
+
+function inGroupCall(userId: string) {
+  for (const g of groupCalls.values()) if (g.participants.has(userId)) return true;
+  return false;
+}
+
+async function profiles(ids: string[]) {
+  if (!ids.length) return [];
+  const { rows } = await query<{ id: string; username: string; display_name: string; avatar_url: string | null }>(
+    'SELECT id, username, display_name, avatar_url FROM users WHERE id = ANY($1::uuid[])',
+    [ids],
+  );
+  return rows.map((r) => ({ id: r.id, username: r.username, displayName: r.display_name, avatarUrl: r.avatar_url }));
+}
+
+async function groupMembers(conversationId: string, userId: string) {
+  const { messageService } = await import('../services/message.service.js');
+  return messageService.groupCallMembers(conversationId, userId);
+}
+
+/** Tell every member of the group whether a call is running (drives the "Join call" banner). */
+async function broadcastGroupCallState(conversationId: string) {
+  const { rows } = await query<{ user_id: string }>('SELECT user_id FROM conversation_participants WHERE conversation_id = $1', [conversationId]);
+  const callId = groupCallByConversation.get(conversationId);
+  const g = callId ? groupCalls.get(callId) : undefined;
+  emit.users(rows.map((r) => r.user_id), 'gcall:state', g
+    ? { conversationId, callId: g.id, kind: g.kind, participants: await profiles([...g.participants.keys()]) }
+    : { conversationId, callId: null });
+}
+
+async function endGroupCall(g: GroupCall) {
+  if (!groupCalls.has(g.id)) return;
+  groupCalls.delete(g.id);
+  groupCallByConversation.delete(g.conversationId);
+  if (g.ringTimer) clearTimeout(g.ringTimer);
+  const ids = [...g.participants.keys()];
+  g.participants.clear();
+  if (ids.length) emit.users(ids, 'gcall:ended', { callId: g.id });
+  await broadcastGroupCallState(g.conversationId).catch(() => {});
+  try {
+    const { messageService } = await import('../services/message.service.js');
+    await messageService.recordCall(g.conversationId, g.startedBy, {
+      kind: g.kind,
+      status: g.connectedAt ? 'ended' : 'missed',
+      duration: g.connectedAt ? Math.round((Date.now() - g.connectedAt) / 1000) : 0,
+      group: true,
+      participants: g.everJoined,
+    });
+  } catch (err) {
+    logger.error({ err }, 'failed to record group call');
+  }
+}
+
+async function leaveGroupCall(g: GroupCall, userId: string) {
+  if (!g.participants.delete(userId)) return;
+  emit.users([...g.participants.keys()], 'gcall:peer-left', { callId: g.id, userId });
+  if (g.participants.size === 0) return void endGroupCall(g);
+  await broadcastGroupCallState(g.conversationId).catch(() => {});
+}
+
+function leaveGroupCallsOnSocket(userId: string, socketId: string) {
+  for (const g of groupCalls.values()) if (g.participants.get(userId) === socketId) void leaveGroupCall(g, userId);
+}
+
+function registerGroupCallHandlers(socket: Socket, userId: string) {
+  const validId = (v: unknown): v is string => typeof v === 'string' && /^[0-9a-f-]{36}$/i.test(v);
+
+  // Is a call running in this group? (on opening the chat)
+  socket.on('gcall:status', async (p: unknown, ack?: (r: unknown) => void) => {
+    const reply = typeof ack === 'function' ? ack : () => {};
+    try {
+      const conversationId = (p as { conversationId?: unknown })?.conversationId;
+      if (!validId(conversationId)) return reply({ callId: null });
+      await groupMembers(conversationId, userId);
+      const g = groupCalls.get(groupCallByConversation.get(conversationId) ?? '');
+      reply(g ? { callId: g.id, kind: g.kind, participants: await profiles([...g.participants.keys()]) } : { callId: null });
+    } catch {
+      reply({ callId: null });
+    }
+  });
+
+  /** Start a call in a group — or join the one already running there. Others are rung. */
+  socket.on('gcall:start', async (p: unknown, ack?: (r: unknown) => void) => {
+    const reply = typeof ack === 'function' ? ack : () => {};
+    try {
+      const { conversationId, kind } = (p ?? {}) as { conversationId?: unknown; kind?: unknown };
+      if (!validId(conversationId)) return reply({ error: 'Invalid conversation' });
+      const members = await groupMembers(conversationId, userId);
+      if (inCall(userId)) return reply({ error: "You're already in a call" });
+
+      const existing = groupCalls.get(groupCallByConversation.get(conversationId) ?? '');
+      if (existing) return reply(await joinCall(existing));
+
+      const g: GroupCall = {
+        id: randomUUID(), conversationId, kind: kind === 'video' ? 'video' : 'audio', startedBy: userId,
+        participants: new Map([[userId, socket.id]]), everJoined: 1, startedAt: Date.now(),
+      };
+      groupCalls.set(g.id, g);
+      groupCallByConversation.set(conversationId, g.id);
+      // Nobody joined within the ring time → missed
+      g.ringTimer = setTimeout(() => { if (!g.connectedAt) void endGroupCall(g); }, RING_TIMEOUT_MS);
+
+      const [me] = await profiles([userId]);
+      const conv = await one<{ title: string | null }>('SELECT title FROM conversations WHERE id = $1', [conversationId]);
+      emit.users(members.filter((id) => id !== userId && isOnline(id)), 'gcall:ring', {
+        callId: g.id, conversationId, kind: g.kind, title: conv?.title ?? null, from: me,
+      });
+      await broadcastGroupCallState(conversationId);
+      reply({ callId: g.id, conversationId, kind: g.kind, participants: [] });
+    } catch (err) {
+      reply({ error: err instanceof Error ? err.message : 'Call failed' });
+    }
+  });
+
+  async function joinCall(g: GroupCall) {
+    await groupMembers(g.conversationId, userId); // still a member?
+    if (g.participants.has(userId)) return { callId: g.id, conversationId: g.conversationId, kind: g.kind, participants: await profiles([...g.participants.keys()].filter((id) => id !== userId)) };
+    if (inCall(userId)) return { error: "You're already in a call" };
+    if (g.participants.size >= MAX_GROUP_CALL) return { error: `Group calls are limited to ${MAX_GROUP_CALL} people` };
+    const others = [...g.participants.keys()];
+    g.participants.set(userId, socket.id);
+    g.everJoined += 1;
+    if (!g.connectedAt) { g.connectedAt = Date.now(); if (g.ringTimer) clearTimeout(g.ringTimer); }
+    const [me] = await profiles([userId]);
+    // Everyone already inside expects an offer from the newcomer
+    emit.users(others, 'gcall:peer-joined', { callId: g.id, user: me });
+    emit.user(userId, 'gcall:handled', { callId: g.id, by: socket.id }); // stop ringing on my other tabs
+    await broadcastGroupCallState(g.conversationId);
+    return { callId: g.id, conversationId: g.conversationId, kind: g.kind, participants: await profiles(others) };
+  }
+
+  socket.on('gcall:join', async (p: unknown, ack?: (r: unknown) => void) => {
+    const reply = typeof ack === 'function' ? ack : () => {};
+    try {
+      const g = groupCalls.get(String((p as { callId?: unknown })?.callId));
+      if (!g) return reply({ error: 'This call has ended' });
+      reply(await joinCall(g));
+    } catch (err) {
+      reply({ error: err instanceof Error ? err.message : "Couldn't join the call" });
+    }
+  });
+
+  socket.on('gcall:decline', (p: unknown) => {
+    const callId = String((p as { callId?: unknown })?.callId);
+    emit.user(userId, 'gcall:handled', { callId, by: socket.id });
+  });
+
+  socket.on('gcall:leave', (p: unknown) => {
+    const g = groupCalls.get(String((p as { callId?: unknown })?.callId));
+    if (g) void leaveGroupCall(g, userId);
+  });
+
+  // SDP / ICE between two participants of the same call, plus mute/camera state
+  socket.on('gcall:signal', (p: unknown) => {
+    const { callId, to, data } = (p ?? {}) as { callId?: unknown; to?: unknown; data?: unknown };
+    const g = groupCalls.get(String(callId));
+    if (!g || typeof to !== 'string' || !g.participants.has(userId) || !g.participants.has(to) || to === userId) return;
+    if (!data || JSON.stringify(data).length > 64_000) return;
+    emit.user(to, 'gcall:signal', { callId: g.id, from: userId, data });
   });
 }

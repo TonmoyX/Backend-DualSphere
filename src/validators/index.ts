@@ -129,7 +129,7 @@ export const presignSchema = z.object({
   filename: z.string().min(1).max(200),
   contentType: z.string().min(3).max(100),
   size: z.number().int().positive(),
-  purpose: z.enum(['post', 'avatar', 'cover', 'message', 'story', 'community', 'ad']).default('post'),
+  purpose: z.enum(['post', 'avatar', 'cover', 'message', 'story', 'community', 'ad', 'group']).default('post'),
 });
 
 // ── moderation / admin ──

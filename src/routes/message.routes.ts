@@ -29,7 +29,7 @@ conversationRoutes.get('/:id', validate({ params: v.idParam }), async (req, res)
   res.json({ conversation: await messageService.get(req.validated!.params.id, req.user!.id) });
 });
 
-conversationRoutes.patch('/:id', validate({ params: v.idParam, body: z.object({ title: z.string().trim().max(60).nullable().optional(), muted: z.boolean().optional() }) }), async (req, res) => {
+conversationRoutes.patch('/:id', validate({ params: v.idParam, body: z.object({ title: z.string().trim().max(60).nullable().optional(), muted: z.boolean().optional(), avatarMediaId: v.uuid.nullable().optional() }) }), async (req, res) => {
   res.json({ conversation: await messageService.update(req.validated!.params.id, req.user!, req.body) });
 });
 
@@ -67,6 +67,7 @@ conversationRoutes.post(
       heart: z.boolean().optional(),
       clientId: z.string().max(64).optional(),
       voiceDuration: z.number().positive().max(3600).optional(),
+      anonymous: z.boolean().optional(), // group chats only
     }),
   }),
   async (req, res) => {

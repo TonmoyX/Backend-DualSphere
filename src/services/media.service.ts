@@ -92,7 +92,7 @@ export async function deleteEmptyPosts(postIds: string[]) {
 
 export const mediaService = {
   /** Step 1: reserve an object key and return a direct-upload URL (R2 presigned PUT, or signed local URL). */
-  async presign(userId: string, input: { filename: string; contentType: string; size: number; purpose: 'post' | 'avatar' | 'cover' | 'message' | 'story' | 'community' | 'ad' }) {
+  async presign(userId: string, input: { filename: string; contentType: string; size: number; purpose: 'post' | 'avatar' | 'cover' | 'message' | 'story' | 'community' | 'ad' | 'group' }) {
     const s = getSettings();
     if (!s.features.mediaUploadsEnabled) throw forbidden('UPLOADS_DISABLED', 'Media uploads are disabled');
     const info = MIME[input.contentType];
@@ -203,6 +203,14 @@ export const mediaService = {
     return m.url as string;
   },
 
+  /** Group chat photo: a ready image this user uploaded with purpose "group". */
+  async useForGroup(userId: string, mediaId: string) {
+    const m = await one(`SELECT * FROM media WHERE id = $1 AND owner_id = $2 AND status = 'ready' AND purpose = 'group' AND kind = 'image'`, [mediaId, userId]);
+    if (!m) throw badRequest('INVALID_MEDIA', 'Upload the image first');
+    await query(`UPDATE media SET status = 'attached' WHERE id = $1`, [mediaId]);
+    return m.url as string;
+  },
+
   /** Community icon / banner: a ready image this user uploaded with purpose "community". */
   async useForCommunity(userId: string, mediaId: string) {
     const m = await one(`SELECT * FROM media WHERE id = $1 AND owner_id = $2 AND status = 'ready' AND purpose = 'community' AND kind = 'image'`, [mediaId, userId]);
@@ -232,6 +240,7 @@ export const mediaService = {
           OR EXISTS (SELECT 1 FROM posts WHERE media @> jsonb_build_array(jsonb_build_object('url', $1::text)))
           OR EXISTS (SELECT 1 FROM stories WHERE media_url = $1)
           OR EXISTS (SELECT 1 FROM communities WHERE icon_url = $1 OR banner_url = $1)
+          OR EXISTS (SELECT 1 FROM conversations WHERE avatar_url = $1)
           OR EXISTS (SELECT 1 FROM business_pages WHERE logo_url = $1)
           OR EXISTS (SELECT 1 FROM ad_creatives WHERE media @> jsonb_build_array(jsonb_build_object('url', $1::text)))`,
       [url],

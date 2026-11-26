@@ -23,7 +23,7 @@ export const moderationService = {
               c.content AS comment_content, c.is_removed AS comment_removed, c.post_id AS comment_post_id,
               ca.username AS comment_author_username,
               msg.content AS message_content, msg.media AS message_media, msg.removed_by_mod AS message_removed,
-              msg.unsent_at AS message_unsent, ma.username AS message_author_username,
+              msg.unsent_at AS message_unsent, msg.is_anonymous AS message_anon, ma.username AS message_author_username,
               tu.username AS user_username, tu.display_name AS user_display_name, tu.bio AS user_bio,
               tu.avatar_url AS user_avatar_url, tu.is_banned AS user_banned
          FROM reports r
@@ -70,7 +70,7 @@ export const moderationService = {
             : r.target_type === 'message'
               ? {
                   // Only the single reported message is ever shown to staff — never the conversation
-                  content: r.message_content, media: r.message_media ?? [], author: r.message_author_username,
+                  content: r.message_content, media: r.message_media ?? [], author: r.message_anon ? null : r.message_author_username,
                   isRemoved: !!r.message_removed || !!r.message_unsent,
                 }
               : { content: r.comment_content, isRemoved: r.comment_removed, postId: r.comment_post_id, author: r.comment_author_username },

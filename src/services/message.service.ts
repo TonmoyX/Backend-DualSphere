@@ -52,7 +52,7 @@ async function archiveMessages(c: PoolClient, where: { messageId: string } | { c
   const byMsg = 'messageId' in where;
   await c.query(
     `INSERT INTO message_archive (message_id, conversation_id, conversation_title, is_group, participant_ids, sender_id, kind, content, media,
-                                  reply_to_id, edit_history, files, sent_at, edited_at, reason, deleted_by)
+                                  reply_to_id, edit_history, files, sent_at, edited_at, reason, deleted_by, is_anonymous)
      SELECT m.id, m.conversation_id, cv.title, cv.is_group,
             COALESCE((SELECT array_agg(p.user_id) FROM conversation_participants p WHERE p.conversation_id = m.conversation_id), '{}'),
             m.sender_id, m.kind, m.content, m.media, m.reply_to_id,
@@ -60,7 +60,7 @@ async function archiveMessages(c: PoolClient, where: { messageId: string } | { c
                         FROM message_edits e WHERE e.message_id = m.id), '[]'::jsonb),
             COALESCE((SELECT jsonb_agg(jsonb_build_object('mediaId', md.id, 'objectKey', md.object_key, 'storage', md.storage))
                         FROM media md WHERE md.message_id = m.id), '[]'::jsonb),
-            m.created_at, m.edited_at, $2, $3
+            m.created_at, m.edited_at, $2, $3, m.is_anonymous
        FROM messages m JOIN conversations cv ON cv.id = m.conversation_id
       WHERE ${byMsg ? 'm.id = $1' : 'm.conversation_id = $1'} AND m.kind <> 'system'`,
     [byMsg ? where.messageId : where.conversationId, reason, deletedBy],
@@ -76,7 +76,7 @@ async function systemMessage(c: PoolClient, conversationId: string, actorId: str
 const MESSAGE_SELECT = `
   SELECT m.*, u.username, u.display_name, u.avatar_url, u.is_verified,
          r.id AS r_id, r.content AS r_content, r.kind AS r_kind, r.unsent_at AS r_unsent, r.removed_by_mod AS r_removed,
-         r.sender_id AS r_sender_id, ru.display_name AS r_sender_name, jsonb_array_length(r.media) AS r_media_count,
+         r.sender_id AS r_sender_id, ru.display_name AS r_sender_name, r.is_anonymous AS r_anon, jsonb_array_length(r.media) AS r_media_count,
          coalesce((SELECT jsonb_agg(jsonb_build_object('emoji', mr.emoji, 'userId', mr.user_id) ORDER BY mr.created_at)
                      FROM message_reactions mr WHERE mr.message_id = m.id), '[]'::jsonb) AS reactions
     FROM messages m
@@ -84,8 +84,15 @@ const MESSAGE_SELECT = `
     LEFT JOIN messages r ON r.id = m.reply_to_id
     LEFT JOIN users ru ON ru.id = r.sender_id`;
 
-function serializeMessage(m: any) {
+/**
+ * `viewerId` decides what an anonymous group message reveals: its own sender sees themselves; everyone else
+ * (and any broadcast without a viewer) gets sender: null. Never send an unmasked copy to anyone but the sender.
+ */
+function serializeMessage(m: any, viewerId?: string) {
   const gone = !!m.unsent_at || m.removed_by_mod;
+  const anon = !!m.is_anonymous;
+  const showSender = !anon || (!!viewerId && m.sender_id === viewerId);
+  const replyAnon = !!m.r_anon && m.r_sender_id !== viewerId;
   return {
     id: m.id,
     conversationId: m.conversation_id,
@@ -94,14 +101,15 @@ function serializeMessage(m: any) {
     media: gone ? [] : (m.media ?? []),
     unsent: !!m.unsent_at,
     removed: !!m.removed_by_mod,
-    sender: m.sender_id
+    anonymous: anon,
+    sender: m.sender_id && showSender
       ? { id: m.sender_id, username: m.username, displayName: m.display_name, avatarUrl: m.avatar_url, isVerified: !!m.is_verified }
       : null,
     replyTo: m.r_id
       ? {
           id: m.r_id,
-          senderId: m.r_sender_id,
-          senderName: m.r_sender_name,
+          senderId: replyAnon ? null : m.r_sender_id,
+          senderName: replyAnon ? 'Anonymous' : m.r_sender_name,
           kind: m.r_kind,
           content: m.r_unsent || m.r_removed ? '' : String(m.r_content ?? '').slice(0, 140),
           hasMedia: (m.r_media_count ?? 0) > 0,
@@ -118,10 +126,10 @@ function serializeMessage(m: any) {
 }
 export type MessageDTO = ReturnType<typeof serializeMessage>;
 
-function parseCall(content: string): { kind: 'audio' | 'video'; status: 'ended' | 'missed' | 'declined' | 'busy'; duration: number } | null {
+function parseCall(content: string): { kind: 'audio' | 'video'; status: 'ended' | 'missed' | 'declined' | 'busy'; duration: number; group?: boolean; participants?: number } | null {
   try {
     const c = JSON.parse(content);
-    return { kind: c.kind === 'video' ? 'video' : 'audio', status: c.status, duration: Number(c.duration) || 0 };
+    return { kind: c.kind === 'video' ? 'video' : 'audio', status: c.status, duration: Number(c.duration) || 0, group: !!c.group, participants: Number(c.participants) || 0 };
   } catch {
     return null;
   }
@@ -145,6 +153,18 @@ function preview(m: { kind: string; content: string; unsent: boolean; removed: b
     return link[1]!.trim() ? `${link[1]!.trim()} · ${label}` : label;
   }
   return m.content;
+}
+
+/** Broadcast a message: anonymous ones go masked to the other members and unmasked only to their sender. */
+async function emitMessage(members: string[], event: 'dm:message' | 'dm:edit', id: string, extra: Record<string, unknown> = {}) {
+  const row = await one(`${MESSAGE_SELECT} WHERE m.id = $1`, [id]);
+  if (!row) return null;
+  const payload = (viewer?: string) => ({ conversationId: row.conversation_id, message: serializeMessage(row, viewer), ...extra });
+  if (row.is_anonymous && row.sender_id) {
+    emit.users(members.filter((u) => u !== row.sender_id), event, payload());
+    if (members.includes(row.sender_id)) emit.user(row.sender_id, event, payload(row.sender_id));
+  } else emit.users(members, event, payload());
+  return serializeMessage(row, row.sender_id ?? undefined);
 }
 
 async function messageById(id: string) {
@@ -178,6 +198,7 @@ async function summarize(rows: any[], viewerId: string) {
       id: c.id,
       isGroup: c.is_group,
       title: c.title,
+      avatarUrl: (c.avatar_url ?? null) as string | null,
       status: c.status as 'accepted' | 'pending',
       myRole: c.my_role as 'admin' | 'member',
       muted: !!c.muted,
@@ -186,7 +207,8 @@ async function summarize(rows: any[], viewerId: string) {
       lastMessage: c.lm_id
         ? {
             id: c.lm_id,
-            senderId: c.lm_sender,
+            senderId: c.lm_anon && c.lm_sender !== viewerId ? null : c.lm_sender,
+            anonymous: !!c.lm_anon,
             kind: c.lm_kind,
             preview: preview({ kind: c.lm_kind, content: c.lm_content ?? '', unsent: !!c.lm_unsent, removed: !!c.lm_removed, mediaCount: c.lm_media ?? 0, mediaType: c.lm_media_type }),
             createdAt: new Date(c.lm_at).toISOString(),
@@ -215,7 +237,7 @@ async function summarize(rows: any[], viewerId: string) {
       pinnedMessage: c.pm_id
         ? {
             id: c.pm_id,
-            senderName: c.pm_sender_name,
+            senderName: c.pm_anon ? 'Anonymous' : c.pm_sender_name,
             preview: preview({ kind: c.pm_kind, content: c.pm_content ?? '', unsent: !!c.pm_unsent, removed: !!c.pm_removed, mediaCount: c.pm_media ?? 0 }),
           }
         : null,
@@ -227,8 +249,8 @@ export type ConversationDTO = Awaited<ReturnType<typeof summarize>>[number];
 const CONVERSATION_SELECT = `
   SELECT c.*, p.status, p.role AS my_role, p.muted, p.last_read_at, p.cleared_at, p.pinned_at,
          pm.id AS pm_id, pm.content AS pm_content, pm.kind AS pm_kind, pm.unsent_at AS pm_unsent, pm.removed_by_mod AS pm_removed,
-         jsonb_array_length(pm.media) AS pm_media, pmu.display_name AS pm_sender_name,
-         lm.id AS lm_id, lm.content AS lm_content, lm.kind AS lm_kind, lm.sender_id AS lm_sender, lm.created_at AS lm_at,
+         jsonb_array_length(pm.media) AS pm_media, pmu.display_name AS pm_sender_name, pm.is_anonymous AS pm_anon,
+         lm.id AS lm_id, lm.content AS lm_content, lm.kind AS lm_kind, lm.sender_id AS lm_sender, lm.is_anonymous AS lm_anon, lm.created_at AS lm_at,
          lm.unsent_at AS lm_unsent, lm.removed_by_mod AS lm_removed, jsonb_array_length(lm.media) AS lm_media, lm.media->0->>'type' AS lm_media_type,
          (SELECT count(*) FROM messages m
            WHERE m.conversation_id = c.id AND m.sender_id IS DISTINCT FROM p.user_id AND m.kind <> 'system'
@@ -368,7 +390,7 @@ export const messageService = {
     if (hasMore) rows.pop();
     const oldest = rows.at(-1);
     return {
-      messages: rows.reverse().map(serializeMessage),
+      messages: rows.reverse().map((r) => serializeMessage(r, userId)),
       hasMore,
       cursor: hasMore && oldest ? Buffer.from(`${new Date(oldest.created_at).toISOString()}|${oldest.id}`).toString('base64url') : null,
     };
@@ -377,10 +399,12 @@ export const messageService = {
   async send(
     conversationId: string,
     user: AuthUser,
-    input: { content?: string; mediaIds?: string[]; replyToId?: string | null; heart?: boolean; clientId?: string; voiceDuration?: number; storyRef?: Record<string, unknown> | null },
+    input: { content?: string; mediaIds?: string[]; replyToId?: string | null; heart?: boolean; clientId?: string; voiceDuration?: number; storyRef?: Record<string, unknown> | null; anonymous?: boolean },
   ) {
     assertEnabled();
     const conv = await membership(conversationId, user.id);
+    // Anonymous sending only makes sense with more than one other person
+    if (input.anonymous && !conv.is_group) throw badRequest('ANON_GROUP_ONLY', 'Anonymous messages are only available in group chats');
     const members = await participantIds(conversationId);
     const others = members.filter((id) => id !== user.id);
     if (others.length === 0) throw badRequest('EMPTY_CHAT', 'Nobody else is in this chat');
@@ -401,7 +425,7 @@ export const messageService = {
 
     const id = await tx(async (c) => {
       const { rows } = await c.query(
-        `INSERT INTO messages (conversation_id, sender_id, kind, content, media, reply_to_id, story_ref) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+        `INSERT INTO messages (conversation_id, sender_id, kind, content, media, reply_to_id, story_ref, is_anonymous) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
         [
           conversationId, user.id, kind, content,
           JSON.stringify(media.map((m) => ({
@@ -410,6 +434,7 @@ export const messageService = {
           }))),
           input.replyToId ?? null,
           input.storyRef ? JSON.stringify(input.storyRef) : null,
+          !!input.anonymous && !!conv.is_group,
         ],
       );
       await mediaService.attachToMessage(c, media.map((m) => m.id), rows[0].id);
@@ -420,9 +445,7 @@ export const messageService = {
       return rows[0].id as string;
     });
 
-    const message = (await messageById(id))!;
-    emit.users(members, 'dm:message', { conversationId, message, clientId: input.clientId ?? null });
-    return message;
+    return (await emitMessage(members, 'dm:message', id, { clientId: input.clientId ?? null }))!;
   },
 
   async markRead(conversationId: string, userId: string) {
@@ -453,7 +476,7 @@ export const messageService = {
     emit.user(userId, 'dm:unread', {});
   },
 
-  async update(conversationId: string, user: AuthUser, input: { title?: string | null; muted?: boolean }) {
+  async update(conversationId: string, user: AuthUser, input: { title?: string | null; muted?: boolean; avatarMediaId?: string | null }) {
     const conv = await membership(conversationId, user.id);
     if (input.muted !== undefined) {
       await query('UPDATE conversation_participants SET muted = $3 WHERE conversation_id = $1 AND user_id = $2', [conversationId, user.id, input.muted]);
@@ -466,6 +489,18 @@ export const messageService = {
         await c.query('UPDATE conversations SET title = $2 WHERE id = $1', [conversationId, title]);
         await systemMessage(c, conversationId, user.id, title ? `${me?.display_name} named the group "${title}"` : `${me?.display_name} removed the group name`);
       });
+      emit.users(await participantIds(conversationId), 'dm:conversation', { conversationId });
+    }
+    // Group photo — any member can change or remove it (same as the name)
+    if (input.avatarMediaId !== undefined) {
+      if (!conv.is_group) throw badRequest('NOT_GROUP', 'Only groups have a group photo');
+      const url = input.avatarMediaId ? await mediaService.useForGroup(user.id, input.avatarMediaId) : null;
+      const me = await one<{ display_name: string }>('SELECT display_name FROM users WHERE id = $1', [user.id]);
+      await tx(async (c) => {
+        await c.query('UPDATE conversations SET avatar_url = $2 WHERE id = $1', [conversationId, url]);
+        await systemMessage(c, conversationId, user.id, url ? `${me?.display_name} changed the group photo` : `${me?.display_name} removed the group photo`);
+      });
+      if (conv.avatar_url && conv.avatar_url !== url) await mediaService.releaseIfUnused(conv.avatar_url);
       emit.users(await participantIds(conversationId), 'dm:conversation', { conversationId });
     }
     return this.get(conversationId, user.id);
@@ -534,7 +569,7 @@ export const messageService = {
   },
 
   /** Call history entry (written by the call signalling layer). */
-  async recordCall(conversationId: string, callerId: string, call: { kind: 'audio' | 'video'; status: string; duration: number }) {
+  async recordCall(conversationId: string, callerId: string, call: { kind: 'audio' | 'video'; status: string; duration: number; group?: boolean; participants?: number }) {
     const id = await tx(async (c) => {
       const { rows } = await c.query(
         `INSERT INTO messages (conversation_id, sender_id, kind, content) VALUES ($1, $2, 'call', $3) RETURNING id`,
@@ -547,6 +582,15 @@ export const messageService = {
     });
     const message = (await messageById(id))!;
     emit.users(await participantIds(conversationId), 'dm:message', { conversationId, message, clientId: null });
+  },
+
+  /** Group calls: the caller must be an accepted member of a group chat. Returns all member ids. */
+  async groupCallMembers(conversationId: string, userId: string) {
+    assertEnabled();
+    const conv = await membership(conversationId, userId);
+    if (!conv.is_group) throw badRequest('NOT_GROUP', 'Use a normal call for one-to-one chats');
+    if (conv.status === 'pending') throw forbidden('REQUEST_PENDING', 'Accept the group invite first');
+    return participantIds(conversationId);
   },
 
   /** Can `userId` call in this conversation? Returns the other participant. 1:1 only. */
@@ -578,8 +622,7 @@ export const messageService = {
       await c.query('INSERT INTO message_edits (message_id, previous_content) SELECT id, content FROM messages WHERE id = $1 AND content <> $2', [messageId, text]);
       await c.query('UPDATE messages SET content = $2, edited_at = now() WHERE id = $1', [messageId, text]);
     });
-    const msg = (await messageById(messageId))!;
-    emit.users(await participantIds(m.conversation_id), 'dm:edit', { conversationId: m.conversation_id, message: msg });
+    const msg = (await emitMessage(await participantIds(m.conversation_id), 'dm:edit', messageId))!;
     return msg;
   },
 
@@ -592,7 +635,9 @@ export const messageService = {
     if (src.unsent_at || src.removed_by_mod || src.kind === 'system' || src.kind === 'call') throw badRequest('CANT_FORWARD', "This message can't be forwarded");
     const origin = src.forwarded_from_name
       ? { name: src.forwarded_from_name, id: src.forwarded_from_user }
-      : await one<{ name: string; id: string }>('SELECT display_name AS name, id FROM users WHERE id = $1', [src.sender_id]);
+      : src.is_anonymous
+        ? { name: 'Anonymous', id: null }
+        : await one<{ name: string; id: string }>('SELECT display_name AS name, id FROM users WHERE id = $1', [src.sender_id]);
     const sent: string[] = [];
     for (const cid of [...new Set(conversationIds)].slice(0, 20)) {
       const conv = await membership(cid, user.id);
@@ -655,7 +700,7 @@ export const messageService = {
         ORDER BY m.created_at DESC LIMIT 50`,
       [conversationId, conv.cleared_at, `%${q.replace(/[%_\\]/g, '\\$&')}%`, userId],
     );
-    return rows.map(serializeMessage);
+    return rows.map((r) => serializeMessage(r, userId));
   },
 
   /** "Delete for me": hides one message only for this participant (theirs or anyone's). */

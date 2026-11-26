@@ -146,7 +146,7 @@ export const investigationService = {
     if (!member) throw forbidden('OUTSIDE_CASE', "This conversation doesn't involve the user in this case");
 
     const { rows: live } = await query(
-      `SELECT m.id, m.kind, m.content, m.media, m.reply_to_id, m.created_at, m.edited_at, m.removed_by_mod,
+      `SELECT m.id, m.kind, m.content, m.media, m.reply_to_id, m.created_at, m.edited_at, m.removed_by_mod, m.is_anonymous,
               u.id AS s_id, u.username AS s_username, u.display_name AS s_display_name, u.avatar_url AS s_avatar_url,
               COALESCE((SELECT jsonb_agg(jsonb_build_object('content', e.previous_content, 'editedAt', e.edited_at) ORDER BY e.edited_at)
                           FROM message_edits e WHERE e.message_id = m.id), '[]'::jsonb) AS edit_history
@@ -167,6 +167,7 @@ export const investigationService = {
         editHistory: m.edit_history as { content: string; editedAt: string }[],
         deleted: null as null | { reason: string; at: string },
         removedByModerator: !!m.removed_by_mod,
+        anonymous: !!m.is_anonymous,
         sender: userShape(m, 's_'),
       })),
       ...gone.map((a) => ({
@@ -175,6 +176,7 @@ export const investigationService = {
         editHistory: a.edit_history as { content: string; editedAt: string }[],
         deleted: { reason: a.reason as string, at: new Date(a.deleted_at).toISOString() },
         removedByModerator: false,
+        anonymous: !!a.is_anonymous,
         sender: userShape(a, 's_'),
       })),
     ].sort((x, y) => +new Date(x.sentAt) - +new Date(y.sentAt));
